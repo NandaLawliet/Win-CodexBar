@@ -37,7 +37,9 @@ vi.mock("@tauri-apps/api/event", () => eventMocks);
 
 // Stand-in surfaces: assert routing, not each surface's own rendering.
 vi.mock("./surfaces/TrayPanel", () => ({
-  default: () => <div data-testid="surface-tray-panel" />,
+  default: ({ presentation }: { presentation?: string }) => (
+    <div data-testid="surface-tray-panel" data-presentation={presentation} />
+  ),
 }));
 vi.mock("./surfaces/PopOutPanel", () => ({
   default: () => <div data-testid="surface-pop-out-panel" />,
@@ -171,6 +173,10 @@ describe("App window-label routing", () => {
     await waitFor(() => {
       expect(queryByTestId("surface-tray-panel")).not.toBeNull();
     });
+    expect(queryByTestId("surface-tray-panel")).toHaveAttribute(
+      "data-presentation",
+      "personal-minimal",
+    );
     expect(queryByTestId("surface-pop-out-panel")).toBeNull();
     expect(queryByTestId("surface-settings")).toBeNull();
     expect(queryByTestId("surface-float-bar")).toBeNull();

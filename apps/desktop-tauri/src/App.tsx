@@ -186,7 +186,7 @@ function AppInner() {
   // TrayPanel is statically imported (not lazy), so no Suspense boundary is
   // needed here, unlike the other detached-window branches above.
   if (isFlyoutWindow()) {
-    return <TrayPanel state={state} />;
+    return <TrayPanel state={state} presentation="personal-minimal" />;
   }
 
   return <SurfaceRouter surface={surface} state={state} />;
@@ -203,7 +203,7 @@ function SurfaceRouter({
     case "hidden":
       return null;
     case "trayPanel":
-      return <TrayPanel state={state} />;
+      return <TrayPanel state={state} presentation="personal-minimal" />;
     case "popOut": {
       const providerId =
         surface.target.kind === "provider"
@@ -222,7 +222,7 @@ function SurfaceRouter({
         </Suspense>
       );
     default:
-      return <TrayPanel state={state} />;
+      return <TrayPanel state={state} presentation="personal-minimal" />;
   }
 }
 

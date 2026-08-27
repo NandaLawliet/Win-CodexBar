@@ -66,11 +66,11 @@ import type {
   SettingsSnapshot,
 } from "../types/bridge";
 
-function rateWindow(used: number) {
+function rateWindow(used: number, windowMinutes: number | null = null) {
   return {
     usedPercent: used,
     remainingPercent: 100 - used,
-    windowMinutes: null,
+    windowMinutes,
     resetsAt: null,
     resetDescription: null,
     isExhausted: false,
@@ -187,12 +187,13 @@ function renderTrayPanel(
   providers: ProviderUsageSnapshot[],
   settingsOverrides: Partial<SettingsSnapshot> = {},
   catalog: ProviderCatalogEntry[] = [],
+  presentation: "full" | "personal-minimal" = "full",
 ) {
   tauriMocks.getCachedProviders.mockResolvedValue(providers);
   tauriMocks.getSettingsSnapshot.mockResolvedValue(settings(settingsOverrides));
   return render(
     <LocaleProvider>
-      <TrayPanel state={bootstrap(settingsOverrides, catalog)} />
+      <TrayPanel state={bootstrap(settingsOverrides, catalog)} presentation={presentation} />
     </LocaleProvider>,
   );
 }
@@ -256,6 +257,7 @@ describe("TrayPanel provider grid", () => {
         PanelShowFewerProviders: "Show fewer providers",
         PanelUsedSuffix: "used",
         PanelZoom: "Zoom",
+        ProviderWeeklyLabel: "Weekly",
       }),
     );
     eventMocks.listen.mockImplementation(
@@ -517,6 +519,45 @@ describe("TrayPanel provider grid", () => {
         (node) => node.textContent,
       ),
     ).toEqual(["Codex", "Claude", "Cursor", "Factory", "Gemini"]);
+  });
+
+  it("limits the personal compact presentation to Claude, Codex, and z.ai quota rows", async () => {
+    const providers = [
+      provider("copilot", "GitHub Copilot", 90),
+      provider("zai", "z.ai", 30),
+      provider("codex", "Codex", 20),
+      provider("claude", "Claude", 10),
+    ];
+    for (const snapshot of providers) {
+      snapshot.primary = rateWindow(snapshot.primary.usedPercent, 5 * 60);
+      snapshot.primaryLabel = "Session";
+      snapshot.secondary = rateWindow(snapshot.primary.usedPercent + 5, 7 * 24 * 60);
+      snapshot.secondaryLabel = "Weekly";
+      snapshot.extraRateWindows = [
+        { id: "credits", title: "Credits", window: rateWindow(5) },
+      ];
+    }
+
+    const { container } = renderTrayPanel(
+      providers,
+      { enabledProviders: providers.map((snapshot) => snapshot.providerId) },
+      [],
+      "personal-minimal",
+    );
+
+    await waitFor(() => {
+      expect(container.querySelectorAll(".menu-stack__item")).toHaveLength(3);
+    });
+    expect(
+      Array.from(container.querySelectorAll(".menu-stack__item")).map((item) => item.id),
+    ).toEqual(["card-claude", "card-codex", "card-zai"]);
+    expect(container.querySelector("#card-copilot")).toBeNull();
+    expect(container.querySelectorAll(".menu-metric__title")).toHaveLength(6);
+    expect(screen.getAllByText("5-hour")).toHaveLength(3);
+    expect(screen.getAllByText("Weekly")).toHaveLength(3);
+    expect(screen.queryByText("Credits")).not.toBeInTheDocument();
+    expect(tauriMocks.getUsageSpendSummary).not.toHaveBeenCalled();
+    expect(tauriMocks.getProviderChartData).not.toHaveBeenCalled();
   });
 
   it("uses independent columns for a wide user-sized overview", async () => {

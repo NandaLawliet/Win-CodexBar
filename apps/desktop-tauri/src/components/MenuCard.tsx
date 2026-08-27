@@ -50,6 +50,8 @@ export interface MenuCardDisplayOptions {
   showAsUsed?: boolean;
   compactMetrics?: boolean;
   costSummaryDisplayStyle?: CostSummaryDisplayStyle;
+  /** Personal compact surface: only canonical 5-hour and weekly quota rows. */
+  quotaWindowsOnly?: boolean;
 }
 
 interface MenuCardProps {
@@ -136,6 +138,7 @@ export default function MenuCard({
     showAsUsed = false,
     compactMetrics = false,
     costSummaryDisplayStyle,
+    quotaWindowsOnly = false,
   } = display;
   const { t, language } = useLocale();
   const [chartData, setChartData] = useState<ProviderChartData | null>(null);
@@ -151,7 +154,7 @@ export default function MenuCard({
   }, [provider.providerId]);
 
   useEffect(() => {
-    if (!providerSupportsChartData(provider.providerId)) {
+    if (quotaWindowsOnly || !providerSupportsChartData(provider.providerId)) {
       setChartData(null);
       return;
     }
@@ -173,15 +176,17 @@ export default function MenuCard({
     return () => {
       cancelled = true;
     };
-  }, [provider.providerId, provider.accountEmail, onLayoutChange]);
+  }, [provider.providerId, provider.accountEmail, onLayoutChange, quotaWindowsOnly]);
 
   const isWayfinder = provider.providerId === "wayfinder";
-  const email = !isWayfinder && provider.accountEmail
+  const email = !quotaWindowsOnly && !isWayfinder && provider.accountEmail
     ? hideEmail
       ? maskEmail(provider.accountEmail)
       : provider.accountEmail
     : null;
-  const planName = !isWayfinder ? displayPlanName(provider.planName, t) : null;
+  const planName = !quotaWindowsOnly && !isWayfinder
+    ? displayPlanName(provider.planName, t)
+    : null;
 
   const metrics: MetricEntry[] = [
     ...(isWayfinder
@@ -223,14 +228,28 @@ export default function MenuCard({
       resetFormatMode: extra.id === "reset-credits" ? "expires" : "reset",
     });
   }
-  const visibleMetrics = compactMetrics ? metrics.slice(0, 2) : metrics;
+  const visibleMetrics = quotaWindowsOnly
+    ? [
+        metrics.find((metric) => metric.snap.windowMinutes === 5 * 60),
+        metrics.find((metric) => metric.snap.windowMinutes === 7 * 24 * 60),
+      ].flatMap((metric, index) =>
+        metric
+          ? [{ ...metric, label: index === 0 ? "5-hour" : t("ProviderWeeklyLabel") }]
+          : [],
+      )
+    : compactMetrics
+      ? metrics.slice(0, 2)
+      : metrics;
+  const detailChartData = quotaWindowsOnly ? null : chartData;
+  const detailCostStyle = quotaWindowsOnly ? "hidden" : costSummaryDisplayStyle;
+  const detailShowPace = quotaWindowsOnly ? false : showPace;
 
   const presence = describeCard(
     provider,
-    chartData,
+    detailChartData,
     visibleMetrics,
-    costSummaryDisplayStyle,
-    showPace,
+    detailCostStyle,
+    detailShowPace,
   );
   const { hasDetails } = presence;
   const cardClassName = [
@@ -260,7 +279,7 @@ export default function MenuCard({
             <div className="menu-card__error-text">{provider.error}</div>
             <CopyIconButton text={provider.error} />
           </div>
-        ) : (
+        ) : !quotaWindowsOnly ? (
           <div className="menu-card__subtitle-row">
             <span className="menu-card__subtitle">
               {Number.isNaN(Date.parse(provider.updatedAt))
@@ -271,7 +290,7 @@ export default function MenuCard({
               <span className="menu-card__plan-badge">{planName}</span>
             )}
           </div>
-        )}
+        ) : null}
       </header>
 
       {hasDetails && <div className="menu-card__divider" />}
@@ -282,12 +301,12 @@ export default function MenuCard({
           display={{
             resetTimeRelative,
             showResetWhenExhausted,
-            showPace,
+            showPace: detailShowPace,
             showAsUsed,
-            costSummaryDisplayStyle,
+            costSummaryDisplayStyle: detailCostStyle,
           }}
           metrics={visibleMetrics}
-          chartData={chartData}
+          chartData={detailChartData}
           presence={presence}
           onLayoutChange={onLayoutChange}
         />
@@ -320,7 +339,7 @@ export default function MenuCard({
         </section>
       )}
 
-      {provider.providerId === "codex" && (
+      {!quotaWindowsOnly && provider.providerId === "codex" && (
         <CodexAccountsMenu hideEmail={hideEmail} />
       )}
     </article>

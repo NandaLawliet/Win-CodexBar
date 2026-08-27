@@ -84,6 +84,7 @@ function renderCard(
     showAsUsed?: boolean;
     showResetWhenExhausted?: boolean;
     showPace?: boolean;
+    quotaWindowsOnly?: boolean;
     onLayoutChange?: () => void;
   } = {},
 ) {
@@ -97,6 +98,7 @@ function renderCard(
           showAsUsed: opts.showAsUsed,
           showResetWhenExhausted: opts.showResetWhenExhausted,
           showPace: opts.showPace,
+          quotaWindowsOnly: opts.quotaWindowsOnly,
         }}
         onLayoutChange={opts.onLayoutChange}
       />
@@ -122,6 +124,7 @@ describe("MenuCard", () => {
         PanelThirtyDayTokens: "30d tokens",
         PanelTodayBudget: "today",
         PanelUsedSuffix: "used",
+        ProviderWeeklyLabel: "Weekly",
         ResetsInHoursMinutes: "Resets in {}h {}m",
         ResetsInMinutes: "Resets in {}m",
         ResetsInDaysHours: "Resets in {}d {}h",
@@ -212,6 +215,38 @@ describe("MenuCard", () => {
 
     const fill = document.querySelector<HTMLElement>(".menu-metric__bar-fill");
     expect(fill?.style.width).toBe("35%");
+  });
+
+  it("renders only 5-hour and weekly quotas in the personal compact presentation", async () => {
+    const snapshot = provider(null, 20);
+    snapshot.primary = rateWindow(20, { windowMinutes: 5 * 60 });
+    snapshot.primaryLabel = "Session";
+    snapshot.secondary = rateWindow(40, { windowMinutes: 7 * 24 * 60 });
+    snapshot.secondaryLabel = "Weekly";
+    snapshot.tertiary = rateWindow(60, { windowMinutes: 30 * 24 * 60 });
+    snapshot.tertiaryLabel = "Monthly";
+    snapshot.extraRateWindows = [
+      {
+        id: "credits",
+        title: "Credits",
+        window: rateWindow(10),
+      },
+    ];
+    snapshot.accountEmail = "personal@example.test";
+    snapshot.planName = "Max";
+
+    renderCard(snapshot, { quotaWindowsOnly: true, showPace: true });
+
+    expect(await screen.findByText("5-hour")).toBeInTheDocument();
+    expect(screen.getByText("Weekly")).toBeInTheDocument();
+    expect(screen.getByText("80% left")).toBeInTheDocument();
+    expect(screen.getByText("60% left")).toBeInTheDocument();
+    expect(screen.queryByText("Session")).not.toBeInTheDocument();
+    expect(screen.queryByText("Monthly")).not.toBeInTheDocument();
+    expect(screen.queryByText("Credits")).not.toBeInTheDocument();
+    expect(screen.queryByText("personal@example.test")).not.toBeInTheDocument();
+    expect(screen.queryByText("Max")).not.toBeInTheDocument();
+    expect(tauriMocks.getProviderChartData).not.toHaveBeenCalled();
   });
 
   it("displays over-quota usage without overflowing the bar", async () => {

@@ -35,12 +35,23 @@ const HAS_STATUS_PAGE = new Set([
   "openrouter", "vertexai", "windsurf", "xai",
 ]);
 
+const PERSONAL_MINIMAL_PROVIDER_IDS = ["claude", "codex", "zai"] as const;
+const PERSONAL_MINIMAL_PROVIDER_ID_SET = new Set<string>(PERSONAL_MINIMAL_PROVIDER_IDS);
+
+export type TrayPanelPresentation = "full" | "personal-minimal";
+
 /**
  * Tray popover surface — two modes like macOS CodexBar:
  * 1. Overview (default): provider grid + all cards stacked
  * 2. Detail: click a provider in grid → show only that provider's card
  */
-export default function TrayPanel({ state }: { state: BootstrapState }) {
+export default function TrayPanel({
+  state,
+  presentation = "full",
+}: {
+  state: BootstrapState;
+  presentation?: TrayPanelPresentation;
+}) {
   const {
     t,
     settings,
@@ -77,6 +88,32 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
     handleGestureEnd,
     revealClassName,
   } = useTrayPanelController(state);
+  const personalMinimal = presentation === "personal-minimal";
+  const panelProviders = personalMinimal
+    ? PERSONAL_MINIMAL_PROVIDER_IDS.flatMap((providerId) => {
+        const provider = sorted.find((candidate) => candidate.providerId === providerId);
+        return provider ? [provider] : [];
+      })
+    : sorted;
+  const panelSelectedProviderId =
+    personalMinimal &&
+    selectedProviderId !== null &&
+    !PERSONAL_MINIMAL_PROVIDER_ID_SET.has(selectedProviderId)
+      ? null
+      : selectedProviderId;
+  const panelVisibleProviders = personalMinimal
+    ? panelSelectedProviderId === null
+      ? panelProviders
+      : panelProviders.filter(
+          (provider) => provider.providerId === panelSelectedProviderId,
+        )
+    : visibleProviders;
+  const panelWideColumns = personalMinimal
+    ? [
+        panelVisibleProviders.filter((_, index) => index % 2 === 0),
+        panelVisibleProviders.filter((_, index) => index % 2 === 1),
+      ]
+    : wideColumns;
 
   const zoomRow = (
     <div className="menu-surface__footer-row menu-surface__footer-zoom">
@@ -111,7 +148,7 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
 
   const renderProviderCard = (p: ProviderUsageSnapshot) => {
     const isSelected =
-      selectedProviderId !== null && p.providerId === selectedProviderId;
+      panelSelectedProviderId !== null && p.providerId === panelSelectedProviderId;
     return (
       <div
         className={`menu-stack__item${isSelected ? " menu-stack__item--selected" : ""}`}
@@ -127,8 +164,9 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
             showResetWhenExhausted: settings.showResetWhenExhausted,
             showPace: settings.showPace ?? true,
             showAsUsed: settings.showAsUsed,
-            compactMetrics: selectedProviderId === null,
+            compactMetrics: panelSelectedProviderId === null,
             costSummaryDisplayStyle: settings.costSummaryDisplayStyle,
+            quotaWindowsOnly: personalMinimal,
           }}
           accentColor={settings.providerAccentColors[p.providerId]}
           onLayoutChange={requestLayout}
@@ -137,7 +175,7 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
     );
   };
 
-  if (sorted.length === 0) {
+  if (panelProviders.length === 0) {
     return (
       <div className={revealClassName}>
         <MenuSurface
@@ -175,24 +213,30 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
       >
         {settings.agentSessionsEnabled && <AgentSessions />}
         <ProviderGrid
-          providers={expectsDenseOverview ? denseTrayProviders : sorted}
-          selectedProviderId={selectedProviderId}
+          providers={
+            personalMinimal
+              ? panelProviders
+              : expectsDenseOverview
+                ? denseTrayProviders
+                : sorted
+          }
+          selectedProviderId={panelSelectedProviderId}
           showAsUsed={settings.showAsUsed}
           showProviderIcons={settings.switcherShowsIcons}
-          expanded={gridExpanded}
-          onExpandedChange={setGridExpanded}
+          expanded={personalMinimal ? undefined : gridExpanded}
+          onExpandedChange={personalMinimal ? undefined : setGridExpanded}
           onSelect={handleGridClick}
-          onReorder={handleReorder}
-          onGestureStart={handleGestureStart}
-          onGestureEnd={handleGestureEnd}
+          onReorder={personalMinimal ? undefined : handleReorder}
+          onGestureStart={personalMinimal ? undefined : handleGestureStart}
+          onGestureEnd={personalMinimal ? undefined : handleGestureEnd}
         />
         <div className="provider-grid__divider" />
-        {selectedProviderId === null && (
+        {!personalMinimal && panelSelectedProviderId === null && (
           <OverviewSpendSummary providerIds={sorted.map((provider) => provider.providerId)} t={t} />
         )}
         <div className="menu-stack">
           {useWideColumns
-            ? wideColumns.map((column) => (
+            ? panelWideColumns.map((column) => (
                 <div
                   className="menu-stack__column"
                   key={column.map((p) => p.providerId).join("|") || "empty"}
@@ -200,7 +244,7 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
                   {column.map(renderProviderCard)}
                 </div>
               ))
-            : visibleProviders.map((p, idx) => (
+            : panelVisibleProviders.map((p, idx) => (
                 <Fragment key={p.providerId}>
                   {idx > 0 && <div className="menu-stack__sep" />}
                   {renderProviderCard(p)}
@@ -208,14 +252,14 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
               ))}
         </div>
         {/* Context actions — detail mode only, matches macOS actionsSection */}
-        {selectedProviderId && (HAS_DASHBOARD.has(selectedProviderId) || HAS_STATUS_PAGE.has(selectedProviderId)) && (
+        {panelSelectedProviderId && (HAS_DASHBOARD.has(panelSelectedProviderId) || HAS_STATUS_PAGE.has(panelSelectedProviderId)) && (
           <div className="context-actions">
             <div className="context-actions__divider" />
-            {HAS_DASHBOARD.has(selectedProviderId) && (
+            {HAS_DASHBOARD.has(panelSelectedProviderId) && (
               <button
                 type="button"
                 className="context-actions__btn"
-                onClick={() => void openProviderDashboard(selectedProviderId)}
+                onClick={() => void openProviderDashboard(panelSelectedProviderId)}
               >
                 <span className="context-actions__icon" aria-hidden>
                   <svg width="13" height="13" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -227,11 +271,11 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
                 {t("ActionUsageDashboard")}
               </button>
             )}
-            {HAS_STATUS_PAGE.has(selectedProviderId) && (
+            {HAS_STATUS_PAGE.has(panelSelectedProviderId) && (
               <button
                 type="button"
                 className="context-actions__btn"
-                onClick={() => void openProviderStatusPage(selectedProviderId)}
+                onClick={() => void openProviderStatusPage(panelSelectedProviderId)}
               >
                 <span className="context-actions__icon" aria-hidden>
                   <svg width="14" height="13" viewBox="0 0 18 14" fill="none" xmlns="http://www.w3.org/2000/svg">
