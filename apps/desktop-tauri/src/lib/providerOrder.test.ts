@@ -6,6 +6,7 @@ const catalog: ProviderCatalogEntry[] = [
   { id: "codex", displayName: "Codex", cookieDomain: null },
   { id: "claude", displayName: "Claude", cookieDomain: null },
   { id: "gemini", displayName: "Gemini", cookieDomain: null },
+  { id: "antigravity", displayName: "Antigravity", cookieDomain: null },
 ];
 
 function snapshot(providerId: string, displayName: string): ProviderUsageSnapshot {
@@ -66,5 +67,30 @@ describe("orderProviderSnapshots", () => {
       "claude",
       "codex",
     ]);
+  });
+
+  it("keeps an enabled provider visible while its snapshot is still missing", () => {
+    const ordered = orderProviderSnapshots(
+      [
+        snapshot("claude", "Claude"),
+        snapshot("codex", "Codex"),
+      ],
+      catalog,
+      ["claude", "codex", "antigravity"],
+      ["claude", "codex", "antigravity"],
+    );
+
+    expect(ordered.map((provider) => provider.providerId)).toEqual([
+      "claude",
+      "codex",
+      "antigravity",
+    ]);
+
+    const antigravity = ordered.find(
+      (provider) => provider.providerId === "antigravity",
+    );
+    expect(antigravity?.displayName).toBe("Antigravity");
+    expect(antigravity?.sourceLabel).toBe("pending");
+    expect(antigravity?.error).toBe("Loading provider data...");
   });
 });
