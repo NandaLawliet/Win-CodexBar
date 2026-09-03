@@ -48,6 +48,10 @@ export interface MenuCardDisplayOptions {
   showResetWhenExhausted?: boolean;
   showPace?: boolean;
   showAsUsed?: boolean;
+  /**
+   * Compact overview mode: keep only the first two quota metrics and suppress
+   * supplemental local-spend, token, pace, chart, pricing, and account detail.
+   */
   compactMetrics?: boolean;
   costSummaryDisplayStyle?: CostSummaryDisplayStyle;
 }
@@ -142,16 +146,21 @@ export default function MenuCard({
   const [pricingStatus, setPricingStatus] = useState<DeepSeekPricingStatus | null>(null);
 
   useEffect(() => {
-    if (provider.providerId !== "deepseek") return;
+    if (compactMetrics || provider.providerId !== "deepseek") {
+      setPricingStatus(null);
+      return;
+    }
     const onPricing = (event: Event) =>
       setPricingStatus((event as CustomEvent<DeepSeekPricingStatus>).detail);
     window.addEventListener(DEEPSEEK_PRICING_EVENT, onPricing);
     void getDeepSeekPricingStatus().then(setPricingStatus).catch(() => {});
     return () => window.removeEventListener(DEEPSEEK_PRICING_EVENT, onPricing);
-  }, [provider.providerId]);
+  }, [compactMetrics, provider.providerId]);
 
   useEffect(() => {
-    if (!providerSupportsChartData(provider.providerId)) {
+    // The tray overview intentionally stays quota-only. Do not even fetch local
+    // spend/token/chart enrichment there; the provider detail view still does.
+    if (compactMetrics || !providerSupportsChartData(provider.providerId)) {
       setChartData(null);
       return;
     }
@@ -173,7 +182,7 @@ export default function MenuCard({
     return () => {
       cancelled = true;
     };
-  }, [provider.providerId, provider.accountEmail, onLayoutChange]);
+  }, [compactMetrics, provider.providerId, provider.accountEmail, onLayoutChange]);
 
   const isWayfinder = provider.providerId === "wayfinder";
   const email = !isWayfinder && provider.accountEmail
@@ -225,12 +234,20 @@ export default function MenuCard({
   }
   const visibleMetrics = compactMetrics ? metrics.slice(0, 2) : metrics;
 
+  // Compact tray overview is intentionally quota-only. Full provider detail
+  // remains available after selecting a provider from the switcher.
+  const effectiveChartData = compactMetrics ? null : chartData;
+  const effectiveCostSummaryDisplayStyle = compactMetrics
+    ? "hidden"
+    : costSummaryDisplayStyle;
+  const effectiveShowPace = compactMetrics ? false : showPace;
+
   const presence = describeCard(
     provider,
-    chartData,
+    effectiveChartData,
     visibleMetrics,
-    costSummaryDisplayStyle,
-    showPace,
+    effectiveCostSummaryDisplayStyle,
+    effectiveShowPace,
   );
   const { hasDetails } = presence;
   const cardClassName = [
@@ -282,18 +299,18 @@ export default function MenuCard({
           display={{
             resetTimeRelative,
             showResetWhenExhausted,
-            showPace,
+            showPace: effectiveShowPace,
             showAsUsed,
-            costSummaryDisplayStyle,
+            costSummaryDisplayStyle: effectiveCostSummaryDisplayStyle,
           }}
           metrics={visibleMetrics}
-          chartData={chartData}
+          chartData={effectiveChartData}
           presence={presence}
           onLayoutChange={onLayoutChange}
         />
       )}
 
-      {provider.providerId === "deepseek" && pricingStatus && (
+      {!compactMetrics && provider.providerId === "deepseek" && pricingStatus && (
         <section
           className="menu-card__pricing-status"
           aria-label={t("DeepSeekPricingTitle")}
@@ -320,7 +337,7 @@ export default function MenuCard({
         </section>
       )}
 
-      {provider.providerId === "codex" && (
+      {!compactMetrics && provider.providerId === "codex" && (
         <CodexAccountsMenu hideEmail={hideEmail} />
       )}
     </article>
