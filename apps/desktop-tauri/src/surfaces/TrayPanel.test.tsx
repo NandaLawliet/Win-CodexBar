@@ -206,6 +206,7 @@ function emitEvent(event: string, payload: unknown) {
 describe("TrayPanel provider grid", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    localStorage.clear();
     eventMocks.listeners.clear();
     tauriMocks.getDeepSeekPricingStatus.mockResolvedValue(null);
     tauriMocks.getUsageSpendSummary.mockResolvedValue({ rows: [], models: [] });
@@ -902,4 +903,89 @@ describe("TrayPanel provider grid", () => {
       );
     });
   });
+  it("never renders the tray update banner when an update is available", async () => {
+    tauriMocks.getUpdateState.mockResolvedValue({ status: "available", version: "0.56.8", canDownload: true });
+    renderTrayPanel([provider("codex", "Codex")]);
+    await screen.findByRole("button", { name: /Refresh/ });
+    act(() => emitEvent("update-state-changed", { status: "available", version: "0.56.8", canDownload: true }));
+    expect(screen.queryByText(/Update v0\.56\.8/)).not.toBeInTheDocument();
+    expect(document.querySelector(".update-banner")).toBeNull();
+    expect(tauriMocks.getUpdateState).not.toHaveBeenCalled();
+    expect(tauriMocks.downloadUpdate).not.toHaveBeenCalled();
+  });
+
+  it("defaults all optional footer items visible and keeps Refresh final", async () => {
+    const { container } = renderTrayPanel([]);
+    expect(await screen.findByRole("slider", { name: "Zoom" })).toBeVisible();
+    for (const label of [/^Settings/, /^About CodexBar/, /^Quit/]) {
+      expect(screen.getByRole("button", { name: label })).toBeVisible();
+    }
+    const footer = container.querySelector(".menu-surface__footer")!;
+    expect(footer.lastElementChild?.textContent).toContain("Refresh");
+    expect(footer.lastElementChild?.textContent).toContain("Ctrl+R");
+    expect(screen.getByRole("button", { name: "Edit footer visibility" })).toBeVisible();
+  });
+
+  it("persists hidden footer controls and recovers all of them in edit mode", async () => {
+    const first = renderTrayPanel([]);
+    const editor = await screen.findByRole("button", { name: "Edit footer visibility" });
+    fireEvent.click(editor);
+    for (const label of ["Zoom", "Settings...", "About CodexBar", "Quit"]) {
+      fireEvent.click(screen.getByRole("button", { name: `Hide ${label}` }));
+    }
+    expect(first.container.querySelectorAll(".tray-footer__entry--hidden")).toHaveLength(4);
+    expect(screen.queryByRole("button", { name: "Hide Refresh" })).not.toBeInTheDocument();
+    fireEvent.click(editor);
+    expect(screen.queryByRole("slider", { name: "Zoom" })).not.toBeInTheDocument();
+    for (const label of [/^Settings/, /^About CodexBar/, /^Quit/]) {
+      expect(screen.queryByRole("button", { name: label })).not.toBeInTheDocument();
+    }
+    expect(JSON.parse(localStorage.getItem("codexbar.trayFooterVisibility.v1")!)).toEqual({ zoom: false, settings: false, about: false, quit: false });
+    first.unmount();
+    const second = renderTrayPanel([]);
+    const restoredEditor = await screen.findByRole("button", { name: "Edit footer visibility" });
+    expect(second.container.querySelector(".menu-surface__footer-zoom")).toBeNull();
+    expect(screen.getByRole("button", { name: /Refresh/ })).toBeVisible();
+    fireEvent.click(restoredEditor);
+    for (const label of ["Zoom", "Settings...", "About CodexBar", "Quit"]) {
+      fireEvent.click(screen.getByRole("button", { name: `Show ${label}` }));
+    }
+    fireEvent.click(restoredEditor);
+    expect(screen.getByRole("slider", { name: "Zoom" })).toBeVisible();
+    expect(screen.getByRole("button", { name: /Quit/ })).toBeVisible();
+    expect(second.container.querySelector(".menu-surface__footer")?.lastElementChild?.textContent).toContain("Refresh");
+  });
+
+  it.each(["not-json", "null", "[]", '"text"', '{"zoom":"false","quit":0,"unknown":false,"refresh":false,"editor":false}'])
+    ("safely sanitizes malformed visibility data: %s", async (stored) => {
+      localStorage.setItem("codexbar.trayFooterVisibility.v1", stored);
+      renderTrayPanel([]);
+      expect(await screen.findByRole("slider", { name: "Zoom" })).toBeVisible();
+      expect(screen.getByRole("button", { name: /Quit/ })).toBeVisible();
+      expect(screen.getByRole("button", { name: /Refresh/ })).toBeVisible();
+      expect(screen.getByRole("button", { name: "Edit footer visibility" })).toBeVisible();
+      expect(JSON.parse(localStorage.getItem("codexbar.trayFooterVisibility.v1")!)).toEqual({ zoom: true, settings: true, about: true, quit: true });
+    });
+
+  it("ignores unknown keys while preserving valid visibility booleans", async () => {
+    localStorage.setItem("codexbar.trayFooterVisibility.v1", '{"zoom":false,"unknown":false,"refresh":false}');
+    renderTrayPanel([]);
+    await screen.findByRole("button", { name: "Edit footer visibility" });
+    expect(screen.queryByRole("slider", { name: "Zoom" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Refresh/ })).toBeVisible();
+    expect(screen.getByRole("button", { name: /Quit/ })).toBeVisible();
+  });
+
+  it("remains usable when localStorage reads and writes throw", async () => {
+    vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => { throw new Error("storage blocked"); });
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => { throw new Error("storage blocked"); });
+    renderTrayPanel([]);
+    expect(await screen.findByRole("slider", { name: "Zoom" })).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Edit footer visibility" }));
+    fireEvent.click(screen.getByRole("button", { name: "Hide Zoom" }));
+    expect(screen.getByRole("button", { name: "Show Zoom" })).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Show Zoom" }));
+    expect(screen.getByRole("slider", { name: "Zoom" })).toBeVisible();
+  });
+
 });

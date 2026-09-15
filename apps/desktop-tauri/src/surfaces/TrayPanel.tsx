@@ -11,7 +11,7 @@ import {
 } from "../hooks/useTrayPanelController";
 import MenuCard from "../components/MenuCard";
 import MenuSurface, { MenuEmpty } from "../components/MenuSurface";
-import UpdateBanner from "../components/UpdateBanner";
+import TrayFooter from "../components/TrayFooter";
 import ProviderGrid from "../components/ProviderGrid";
 import AgentSessions from "../components/AgentSessions";
 
@@ -64,12 +64,6 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
     requestLayout,
     headerActions,
     footerRows,
-    updateState,
-    checkNow,
-    download,
-    apply,
-    dismiss,
-    openRelease,
     openSettings,
     handleGridClick,
     handleReorder,
@@ -98,14 +92,12 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
     </div>
   );
 
-  const banner = (
-    <UpdateBanner
-      updateState={updateState}
-      onCheck={checkNow}
-      onDownload={download}
-      onApply={apply}
-      onDismiss={dismiss}
-      onOpenRelease={openRelease}
+  const footer = (
+    <TrayFooter
+      zoom={zoomRow}
+      zoomLabel={t("PanelZoom")}
+      rows={footerRows}
+      onLayoutChange={requestLayout}
     />
   );
 
@@ -145,9 +137,7 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
           onRefresh={refresh}
           isRefreshing={isRefreshing}
           actions={headerActions}
-          banner={banner}
-          footerLead={zoomRow}
-          footerRows={footerRows}
+          footerLead={footer}
           style={{ zoom: trayScale }}
         >
           {settings.agentSessionsEnabled && <AgentSessions />}
@@ -168,9 +158,7 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
         onRefresh={refresh}
         isRefreshing={isRefreshing}
         actions={headerActions}
-        banner={banner}
-        footerLead={zoomRow}
-        footerRows={footerRows}
+        footerLead={footer}
         style={{ zoom: trayScale }}
       >
         {settings.agentSessionsEnabled && <AgentSessions />}

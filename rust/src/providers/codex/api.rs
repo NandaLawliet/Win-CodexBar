@@ -16,10 +16,6 @@ const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const USAGE_PATH: &str = "/wham/usage";
 const RESET_CREDITS_PATH: &str = "/wham/rate-limit-reset-credits";
 const CREDENTIAL_CACHE_TTL: Duration = Duration::from_secs(5);
-/// How long an external OAuth token set is trusted after the CLI last
-/// refreshed it. Matches the CLI's own `needs_refresh` window (8 days) so a
-/// token the CLI considers fresh is also trusted here (upstream 0.50.1 #2944).
-const EXTERNAL_OAUTH_STALENESS_WINDOW: chrono::TimeDelta = chrono::Duration::days(8);
 
 static CREDENTIAL_CACHE: OnceLock<Mutex<Option<CachedCodexCredentials>>> = OnceLock::new();
 
@@ -203,7 +199,8 @@ impl CodexApi {
         })?;
 
         let credentials = Self::parse_credentials_json(&content)?;
-        Self::enforce_external_oauth_gate(&credentials)?;
+        // Credential age is not proof of logout. Let the usage endpoint
+        // authenticate the machine session; never rewrite CLI-owned auth.
         Self::store_cached_credentials(auth_path, modified, credentials.clone());
         Ok(credentials)
     }
@@ -219,8 +216,6 @@ impl CodexApi {
                 return Ok(CodexCredentials {
                     access_token: trimmed.to_string(),
                     account_id: None,
-                    is_external_oauth: false,
-                    last_refresh: None,
                 });
             }
         }
@@ -233,7 +228,7 @@ impl CodexApi {
         let access_token = tokens
             .get("access_token")
             .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| {
                 ProviderError::Parse("Missing access_token in Codex credentials".to_string())
             })?
@@ -245,47 +240,10 @@ impl CodexApi {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
 
-        // Upstream 0.50.1 #2944: an OAuth token set with a refresh_token is an
-        // external (CLI-owned) OAuth source. The `last_refresh` timestamp
-        // (written by the CLI) lets us detect staleness.
-        let has_refresh_token = tokens
-            .get("refresh_token")
-            .and_then(|v| v.as_str())
-            .is_some_and(|s| !s.trim().is_empty());
-        let last_refresh = json
-            .get("last_refresh")
-            .and_then(|v| v.as_str())
-            .and_then(parse_timestamp);
-
         Ok(CodexCredentials {
             access_token,
             account_id,
-            is_external_oauth: has_refresh_token,
-            last_refresh,
         })
-    }
-
-    /// Upstream 0.50.1 #2944: when `codex_external_oauth_sources_allowed` is
-    /// OFF (the default), stale external OAuth credential files fail closed
-    /// instead of being used silently. An external OAuth source is an
-    /// auth.json `tokens` object with a `refresh_token` (CLI-owned OAuth,
-    /// not an API key). "Stale" means the CLI has not refreshed the token
-    /// recently (no `last_refresh`, or older than the staleness window).
-    fn enforce_external_oauth_gate(credentials: &CodexCredentials) -> Result<(), ProviderError> {
-        if !credentials.is_external_oauth {
-            return Ok(());
-        }
-        if crate::settings::Settings::load().codex_external_oauth_sources_allowed {
-            return Ok(());
-        }
-        let now = Utc::now();
-        let is_stale = credentials
-            .last_refresh
-            .is_none_or(|last| now - last > EXTERNAL_OAUTH_STALENESS_WINDOW);
-        if is_stale {
-            return Err(ProviderError::AuthRequired);
-        }
-        Ok(())
     }
 
     fn credential_cache() -> &'static Mutex<Option<CachedCodexCredentials>> {
@@ -817,14 +775,6 @@ impl Default for CodexApi {
 struct CodexCredentials {
     access_token: String,
     account_id: Option<String>,
-    /// True when the source is an external OAuth token set (has a
-    /// `refresh_token`), as opposed to an `OPENAI_API_KEY`. Used by the
-    /// `codex_external_oauth_sources_allowed` gate (upstream 0.50.1 #2944).
-    is_external_oauth: bool,
-    /// `last_refresh` timestamp from auth.json, when present. Used to detect
-    /// stale external OAuth tokens that should fail closed when the opt-in
-    /// setting is OFF.
-    last_refresh: Option<DateTime<Utc>>,
 }
 
 struct CachedCodexCredentials {
@@ -971,23 +921,6 @@ impl SpendControlLimitSnapshot {
 
 fn timestamp_to_datetime(timestamp: Option<i64>) -> Option<DateTime<Utc>> {
     timestamp.and_then(|ts| Utc.timestamp_opt(ts, 0).single())
-}
-
-/// Parse an ISO-8601 / RFC-3339 timestamp from the `last_refresh` field of
-/// auth.json. Accepts the same formats the Codex CLI writes.
-fn parse_timestamp(raw: &str) -> Option<DateTime<Utc>> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    DateTime::parse_from_rfc3339(trimmed)
-        .ok()
-        .map(|dt| dt.with_timezone(&Utc))
-        .or_else(|| {
-            chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S%.f")
-                .ok()
-                .map(|naive| DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
-        })
 }
 
 fn json_f64(value: &serde_json::Value) -> Option<f64> {
@@ -1668,92 +1601,122 @@ mod tests {
         assert_eq!(code_review.unwrap().window_minutes, Some(999));
     }
 
-    // ── Upstream 0.50.1 #2944: external OAuth source gate ──────────────────
+    // CLI-owned credential timestamps are advisory; HTTP is authoritative.
+    #[tokio::test]
+    async fn old_machine_credentials_reach_authoritative_usage_endpoint() {
+        for last_refresh in [Some("2020-01-01T00:00:00Z"), None, Some("not-a-date")] {
+            let mut server = mockito::Server::new_async().await;
+            let request = server.mock("GET", "/wham/usage")
+                .match_header("authorization", "Bearer test-token")
+                .match_header("chatgpt-account-id", "acct_test")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(r#"{"rate_limit":{"primary_window":{"used_percent":25,"limit_window_seconds":18000}}}"#)
+                .create_async().await;
+            let home = write_codex_home(&server.url());
+            let credentials = json!({
+                "tokens": {"access_token": "test-token", "refresh_token": "test-refresh", "account_id": "acct_test"},
+                "last_refresh": last_refresh,
+            }).to_string();
+            std::fs::write(home.path().join("auth.json"), &credentials).unwrap();
+            let api = CodexApi::new().with_codex_home(home.path());
+            let (usage, _) = api.fetch_usage().await.expect("machine session accepted");
+            assert_eq!(usage.primary.used_percent, 25.0);
+            request.assert_async().await;
+            assert_eq!(
+                std::fs::read_to_string(home.path().join("auth.json")).unwrap(),
+                credentials
+            );
+        }
+    }
 
-    #[test]
-    fn api_key_credentials_are_not_external_oauth() {
-        let creds = CodexApi::parse_credentials_json(r#"{"OPENAI_API_KEY": "sk-test"}"#)
-            .expect("credentials");
-        assert!(!creds.is_external_oauth);
-        assert!(creds.last_refresh.is_none());
-        assert!(CodexApi::enforce_external_oauth_gate(&creds).is_ok());
+    #[tokio::test]
+    async fn real_auth_rejections_remain_auth_required() {
+        for status in [401, 403] {
+            let mut server = mockito::Server::new_async().await;
+            let request = server
+                .mock("GET", "/wham/usage")
+                .match_header("authorization", "Bearer test-token")
+                .with_status(status)
+                .create_async()
+                .await;
+            let home = write_codex_home(&server.url());
+            std::fs::write(home.path().join("auth.json"), r#"{"tokens":{"access_token":"test-token","refresh_token":"revoked-test-refresh"},"last_refresh":"2020-01-01T00:00:00Z"}"#).unwrap();
+            let api = CodexApi::new().with_codex_home(home.path());
+            assert!(matches!(
+                api.fetch_usage().await,
+                Err(ProviderError::AuthRequired)
+            ));
+            request.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_or_malformed_credentials_never_reach_usage_endpoint() {
+        let mut server = mockito::Server::new_async().await;
+        let request = server
+            .mock("GET", "/wham/usage")
+            .expect(0)
+            .create_async()
+            .await;
+        let home = write_codex_home(&server.url());
+        for content in [
+            "not-json",
+            "{}",
+            r#"{"tokens":{}}"#,
+            r#"{"tokens":{"access_token":"   "}}"#,
+            r#"{"tokens":{"access_token":123}}"#,
+        ] {
+            std::fs::write(home.path().join("auth.json"), content).unwrap();
+            let api = CodexApi::new().with_codex_home(home.path());
+            assert!(matches!(
+                api.fetch_usage().await,
+                Err(ProviderError::Parse(_))
+            ));
+        }
+        std::fs::remove_file(home.path().join("auth.json")).unwrap();
+        let api = CodexApi::new().with_codex_home(home.path());
+        assert!(matches!(
+            api.fetch_usage().await,
+            Err(ProviderError::NotInstalled(_))
+        ));
+        request.assert_async().await;
     }
 
     #[test]
-    fn oauth_tokens_with_refresh_token_are_external_source() {
-        let creds = CodexApi::parse_credentials_json(
-            r#"{
-                "tokens": {
-                    "access_token": "access",
-                    "refresh_token": "refresh",
-                    "account_id": "acct_123"
-                }
-            }"#,
+    fn backend_url_restrictions_and_custom_backend_guidance_remain_intact() {
+        for (url, expected) in [
+            ("http://insecure.example", DEFAULT_BASE_URL),
+            (
+                "https://secure.example/backend-api",
+                "https://secure.example/backend-api",
+            ),
+            ("http://127.0.0.1:1234", "http://127.0.0.1:1234"),
+            ("http://localhost:1234", "http://localhost:1234"),
+        ] {
+            let home = write_codex_home(url);
+            let api = CodexApi::new().with_codex_home(home.path());
+            assert_eq!(api.resolve_base_url(), expected);
+        }
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("config.toml"),
+            "model_provider = \"bedrock\"",
         )
-        .expect("credentials");
-        assert!(creds.is_external_oauth);
-        assert!(creds.last_refresh.is_none());
+        .unwrap();
+        let api = CodexApi::new().with_codex_home(home.path());
+        assert!(
+            matches!(api.load_credentials(), Err(ProviderError::NotInstalled(message)) if message.contains("custom backend"))
+        );
     }
 
     #[test]
-    fn oauth_tokens_without_refresh_token_are_not_external() {
-        let creds = CodexApi::parse_credentials_json(
-            r#"{
-                "tokens": {
-                    "access_token": "access",
-                    "account_id": "acct_123"
-                }
-            }"#,
-        )
-        .expect("credentials");
-        assert!(!creds.is_external_oauth);
-    }
-
-    #[test]
-    fn external_oauth_gate_fails_closed_for_stale_tokens() {
-        let creds = CodexCredentials {
-            access_token: "access".to_string(),
-            account_id: None,
-            is_external_oauth: true,
-            last_refresh: None,
-        };
-        let err = CodexApi::enforce_external_oauth_gate(&creds)
-            .expect_err("stale external OAuth must fail closed");
-        assert!(matches!(err, ProviderError::AuthRequired));
-    }
-
-    #[test]
-    fn external_oauth_gate_fails_closed_for_old_last_refresh() {
-        let old = Utc::now() - chrono::Duration::days(10);
-        let creds = CodexCredentials {
-            access_token: "access".to_string(),
-            account_id: None,
-            is_external_oauth: true,
-            last_refresh: Some(old),
-        };
-        let err = CodexApi::enforce_external_oauth_gate(&creds)
-            .expect_err("old external OAuth must fail closed");
-        assert!(matches!(err, ProviderError::AuthRequired));
-    }
-
-    #[test]
-    fn external_oauth_gate_passes_fresh_tokens() {
-        let fresh = Utc::now() - chrono::Duration::hours(1);
-        let creds = CodexCredentials {
-            access_token: "access".to_string(),
-            account_id: None,
-            is_external_oauth: true,
-            last_refresh: Some(fresh),
-        };
-        assert!(CodexApi::enforce_external_oauth_gate(&creds).is_ok());
-    }
-
-    #[test]
-    fn parse_timestamp_reads_iso8601() {
-        assert!(parse_timestamp("2026-08-17T10:00:00Z").is_some());
-        assert!(parse_timestamp("2026-08-17T10:00:00.123Z").is_some());
-        assert!(parse_timestamp("  2026-08-17T10:00:00Z  ").is_some());
-        assert!(parse_timestamp("").is_none());
-        assert!(parse_timestamp("not-a-date").is_none());
+    fn existing_api_key_and_access_only_credentials_still_parse() {
+        for content in [
+            r#"{"OPENAI_API_KEY":"test-key"}"#,
+            r#"{"tokens":{"access_token":"test-token","account_id":"acct_test"}}"#,
+        ] {
+            assert!(CodexApi::parse_credentials_json(content).is_ok());
+        }
     }
 }

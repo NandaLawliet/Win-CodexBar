@@ -21,7 +21,8 @@ body.floatbar-window #root {
 /* Container is fully transparent — the pills float individually so the
  * group reads like a compact widget sitting on the Windows taskbar. */
 .floatbar {
-  display: inline-flex;
+  display: inline-grid;
+  grid-template-columns: auto auto;
   flex: none;
   align-items: center;
   justify-content: center;
@@ -36,13 +37,14 @@ body.floatbar-window #root {
   height: max-content;
 }
 .floatbar--vertical {
-  flex-direction: column;
-  align-items: center;
+  grid-template-columns: auto;
   gap: calc(3px * var(--floatbar-scale, 1));
 }
 /* Compact line grip, matching the small handle affordance in Windows taskbar
  * widgets while still giving the user a clear drag target. */
 .floatbar__handle {
+  grid-column: 1;
+  grid-row: 1 / span 3;
   width: calc(10px * var(--floatbar-scale, 1));
   height: calc(16px * var(--floatbar-scale, 1));
   flex-shrink: 0;
@@ -68,6 +70,8 @@ body.floatbar-window #root {
   background-color: rgba(255, 255, 255, 0.22);
 }
 .floatbar--vertical .floatbar__handle {
+  grid-row: auto;
+  justify-self: center;
   width: calc(16px * var(--floatbar-scale, 1));
   height: calc(10px * var(--floatbar-scale, 1));
   background-image:
@@ -81,10 +85,12 @@ body.floatbar-window #root {
   background-size: calc(12px * var(--floatbar-scale, 1)) calc(8px * var(--floatbar-scale, 1));
 }
 .floatbar__pill {
-  display: inline-flex;
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
   align-items: center;
   gap: calc(3px * var(--floatbar-scale, 1));
-  padding: calc(1px * var(--floatbar-scale, 1)) calc(5px * var(--floatbar-scale, 1));
+  padding: calc(5px * var(--floatbar-scale, 1)) calc(8px * var(--floatbar-scale, 1));
   min-height: calc(16px * var(--floatbar-scale, 1));
   border-radius: calc(7px * var(--floatbar-scale, 1));
   background: rgba(213, 231, 242, 0.74);
@@ -96,6 +102,15 @@ body.floatbar-window #root {
     0 1px 2px rgba(14, 42, 62, 0.22);
   white-space: nowrap;
   cursor: grab;
+}
+.floatbar__quota {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: calc(4px * var(--floatbar-scale, 1));
+  padding: calc(3px * var(--floatbar-scale, 1)) calc(6px * var(--floatbar-scale, 1));
+  border: 1px solid transparent;
+  border-radius: calc(4px * var(--floatbar-scale, 1));
 }
 .floatbar__pill *,
 .floatbar__cost-pill *,
@@ -153,12 +168,12 @@ body.floatbar-window #root {
   flex-direction: column;
   gap: calc(2px * var(--floatbar-scale, 1));
 }
-.floatbar__pill--warn {
+.floatbar__quota--warn {
   background: rgba(250, 221, 171, 0.84);
   border-color: rgba(255, 246, 219, 0.62);
   color: #7a4c05;
 }
-.floatbar__pill--crit {
+.floatbar__quota--crit {
   background: rgba(255, 194, 194, 0.86);
   border-color: rgba(255, 236, 236, 0.66);
   color: #7f1d1d;
@@ -193,11 +208,6 @@ body.floatbar-window #root {
   font-variant-numeric: tabular-nums;
   line-height: 1;
 }
-.floatbar--vertical .floatbar__text {
-  flex-direction: column;
-  align-items: center;
-  gap: calc(1px * var(--floatbar-scale, 1));
-}
 .floatbar__empty {
   display: inline-flex;
   align-items: center;
@@ -225,11 +235,11 @@ body.floatbar-window #root {
   border-color: rgba(255, 255, 255, 0.64);
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
 }
-.floatbar--light-bg .floatbar__pill--warn {
+.floatbar--light-bg .floatbar__quota--warn {
   border-color: #b45309;
   color: #92400e;
 }
-.floatbar--light-bg .floatbar__pill--crit {
+.floatbar--light-bg .floatbar__quota--crit {
   border-color: #b91c1c;
   color: #991b1b;
 }
@@ -282,19 +292,19 @@ body.floatbar-window #root {
 }
 .floatbar--floating .floatbar__pill,
 .floatbar--floating .floatbar__cost-pill {
-  border-radius: 999px;
+  border-radius: calc(8px * var(--floatbar-scale, 1));
   background: rgba(255, 255, 255, 0.08);
   backdrop-filter: blur(14px) saturate(140%);
   -webkit-backdrop-filter: blur(14px) saturate(140%);
   border: 1px solid var(--brand, rgba(255, 255, 255, 0.22));
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
 }
-.floatbar--floating .floatbar__pill--warn {
+.floatbar--floating .floatbar__quota--warn {
   background: rgba(255, 255, 255, 0.08);
   border-color: #f59e0b;
   color: #fbbf24;
 }
-.floatbar--floating .floatbar__pill--crit {
+.floatbar--floating .floatbar__quota--crit {
   background: rgba(255, 255, 255, 0.08);
   border-color: #ef4444;
   color: #fca5a5;
@@ -315,11 +325,11 @@ body.floatbar-window #root {
   border-color: var(--brand, rgba(20, 22, 26, 0.25));
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
 }
-.floatbar--floating.floatbar--light-bg .floatbar__pill--warn {
+.floatbar--floating.floatbar--light-bg .floatbar__quota--warn {
   border-color: #b45309;
   color: #92400e;
 }
-.floatbar--floating.floatbar--light-bg .floatbar__pill--crit {
+.floatbar--floating.floatbar--light-bg .floatbar__quota--crit {
   border-color: #b91c1c;
   color: #991b1b;
 }
@@ -330,4 +340,56 @@ body.floatbar-window #root {
 }
 .floatbar--floating.floatbar--light-bg .floatbar__handle:hover {
   background-color: rgba(20, 22, 26, 0.18);
+}
+
+/* Quota rows share column tracks so session and weekly stay aligned. */
+.floatbar__providers,
+.floatbar__cost-pill,
+.floatbar__empty,
+.floatbar__refresh {
+  grid-column: 2;
+}
+.floatbar--vertical > * {
+  grid-column: 1;
+}
+.floatbar__providers {
+  display: grid;
+  grid-template-columns: minmax(calc(76px * var(--floatbar-scale, 1)), max-content)
+    minmax(calc(90px * var(--floatbar-scale, 1)), max-content)
+    minmax(calc(110px * var(--floatbar-scale, 1)), max-content);
+  gap: calc(4px * var(--floatbar-scale, 1));
+}
+.floatbar__identity {
+  display: inline-flex;
+  align-items: center;
+  gap: calc(5px * var(--floatbar-scale, 1));
+}
+.floatbar__quota + .floatbar__quota {
+  border-left-color: currentColor;
+}
+.floatbar__quota-label {
+  opacity: 0.8;
+  font-size: 0.9em;
+}
+.floatbar__refresh {
+  display: inline-flex;
+  justify-self: end;
+  align-items: center;
+  gap: calc(4px * var(--floatbar-scale, 1));
+  padding: calc(5px * var(--floatbar-scale, 1)) calc(7px * var(--floatbar-scale, 1));
+  border: 1px solid currentColor;
+  border-radius: calc(5px * var(--floatbar-scale, 1));
+  background: rgba(90, 105, 115, 0.3);
+  color: inherit;
+  font: inherit;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.floatbar__refresh:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.floatbar__refresh:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
 }

@@ -4677,6 +4677,41 @@ html:has(.menu-surface--tray) {
   color: var(--text-muted);
   font-variant-numeric: tabular-nums;
 }
+.tray-footer__entry {
+  display: flex;
+  align-items: center;
+}
+.tray-footer__entry--hidden > .menu-surface__footer-row {
+  opacity: 0.45;
+}
+.tray-footer__eye {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  padding: 5px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.tray-footer__eye:hover {
+  background: rgba(128, 128, 128, 0.12);
+}
+.tray-footer__eye:focus-visible,
+.tray-footer__entry > button:focus-visible {
+  outline: 2px solid var(--text-secondary);
+  outline-offset: -2px;
+}
+.tray-footer__editor {
+  align-self: flex-end;
+}
+.tray-footer__refresh {
+  margin-top: 5px;
+  padding-top: 5px;
+  border-top: 1px solid var(--text-muted);
+}
 .menu-surface__footer-row:hover .menu-surface__footer-shortcut,
 .menu-surface__footer-row:focus-visible .menu-surface__footer-shortcut {
   color: var(--text-secondary);

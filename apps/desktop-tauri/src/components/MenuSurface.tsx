@@ -8,6 +8,7 @@ export interface MenuSurfaceAction {
 }
 
 export interface MenuFooterRow {
+  id?: string;
   icon: string;
   label: string;
   shortcut?: string;

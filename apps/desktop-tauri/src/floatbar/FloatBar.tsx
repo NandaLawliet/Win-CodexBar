@@ -15,6 +15,7 @@ import { useProviders } from "../hooks/useProviders";
 import {
   getProviderLocalUsageSummary,
   getSettingsSnapshot,
+  refreshProviders,
   refreshProvidersIfStale,
 } from "../lib/tauri";
 import { ProviderIcon } from "../components/providers/ProviderIcon";
@@ -23,6 +24,7 @@ import type {
   BootstrapState,
   ProviderLocalUsageSummary,
   ProviderUsageSnapshot,
+  RateWindowSnapshot,
   SettingsSnapshot,
 } from "../types/bridge";
 import { FLOAT_BAR_CONFIG_CHANGED_EVENT, resizeFloatBar } from "./api";
@@ -150,84 +152,89 @@ function CostPill({
     </div>
   );
 }
-/**
- * The capacity pill shown for a single provider.
- *
- * Color follows usage: green default, amber when remaining drops below the
- * high-usage threshold, red when remaining is below the critical threshold
- * or the provider is exhausted.
- */
-function ProviderPill({
-  provider,
-  highRemaining,
-  critRemaining,
-  showAsUsed,
-  scale,
-  showResetInline,
-  resetRelative,
-  usedSuffix,
-  remainingSuffix,
-}: {
+// Only these providers own the subscription session/weekly lane contract.
+// Informational placeholders must never become fabricated quota percentages.
+function quotaWindows(provider: ProviderUsageSnapshot) {
+  if (provider.providerId !== "codex" && provider.providerId !== "claude") return null;
+  const session = !provider.primary.isInformational &&
+    (provider.primary.windowMinutes == null || provider.primary.windowMinutes === 300) &&
+    (!provider.primaryLabel || /^(session|5h|5[- ]hour)$/i.test(provider.primaryLabel))
+    ? provider.primary : null;
+  const weekly = provider.secondary && !provider.secondary.isInformational &&
+    (provider.secondary.windowMinutes == null || provider.secondary.windowMinutes === 10_080) &&
+    (!provider.secondaryLabel || /^weekly$/i.test(provider.secondaryLabel))
+    ? provider.secondary : null;
+  return session || weekly ? { session, weekly } : null;
+}
+
+type QuotaPresentationProps = {
   provider: ProviderUsageSnapshot;
   highRemaining: number;
   critRemaining: number;
   showAsUsed: boolean;
   scale: number;
   showResetInline: boolean;
-  resetRelative: boolean;
   usedSuffix: string;
   remainingSuffix: string;
-}) {
-  const rateWindow = provider.selectedMetric;
+};
+
+function QuotaMetric({
+  rateWindow,
+  label,
+  provider,
+  highRemaining,
+  critRemaining,
+  showAsUsed,
+  scale,
+  showResetInline,
+  usedSuffix,
+  remainingSuffix,
+}: QuotaPresentationProps & { rateWindow: RateWindowSnapshot; label: string }) {
   const remaining = Math.max(0, Math.min(100, rateWindow.remainingPercent));
   const used = Math.max(0, Math.min(100, rateWindow.usedPercent));
-  const displayPercent = showAsUsed ? used : remaining;
-  const displaySuffix = showAsUsed ? usedSuffix : remainingSuffix;
-  const exhausted = rateWindow.isExhausted || provider.error;
-  let tone: "ok" | "warn" | "crit" = "ok";
-  if (exhausted || remaining <= critRemaining) tone = "crit";
-  else if (remaining <= highRemaining) tone = "warn";
-
-  const brand = getProviderIcon(provider.providerId).brandColor;
-  const label = provider.error ? "—" : `${Math.round(displayPercent)}%`;
-  const resetText = useFormattedResetTime(
-    rateWindow.resetsAt,
-    rateWindow.resetDescription,
-    resetRelative,
-  );
-  const resetSuffix = resetText ? `\n${resetText}` : "";
-  const inlineReset = resetText ? inlineResetTime(resetText) : null;
-  const iconSize = Math.round(11 * scale);
-  const resetIconSize = Math.round(10 * scale);
-
+  const suffix = showAsUsed ? usedSuffix : remainingSuffix;
+  const value = provider.error ? "—" : `${Math.round(showAsUsed ? used : remaining)}%`;
+  const tone = provider.error || rateWindow.isExhausted || remaining <= critRemaining
+    ? "crit" : remaining <= highRemaining ? "warn" : "ok";
+  // This surface explicitly presents countdowns, independently of the tray's
+  // relative/absolute reset preference, using the shared localized formatter.
+  const resetText = useFormattedResetTime(rateWindow.resetsAt, rateWindow.resetDescription, true);
+  const countdown = resetText ? inlineResetTime(resetText) : null;
   return (
-    <div
-      className={`floatbar__pill floatbar__pill--${tone}`}
-      title={`${provider.displayName}: ${label} ${displaySuffix}${resetSuffix}`}
-      data-tauri-drag-region
-      style={{ "--brand": brand } as CSSProperties}
-    >
-      <span className="floatbar__provider-icon" data-tauri-drag-region>
-        <ProviderIcon providerId={provider.providerId} size={iconSize} />
-      </span>
+    <div className={`floatbar__quota floatbar__quota--${tone}`} data-tauri-drag-region
+      title={`${provider.displayName}: ${label} ${value} ${suffix}${resetText ? `\n${resetText}` : ""}`}>
       <span className="floatbar__text" data-tauri-drag-region>
-        <span className="floatbar__pct" data-tauri-drag-region>
-          {label}
-        </span>
-        {showResetInline && resetText && inlineReset && (
-          <span
-            className="floatbar__reset"
-            title={resetText}
-            aria-label={resetText}
-            data-tauri-drag-region
-          >
-            <ResetIcon size={resetIconSize} />
-            <span className="floatbar__reset-time" data-tauri-drag-region>
-              {inlineReset}
-            </span>
-          </span>
-        )}
+        <span className="floatbar__quota-label" data-tauri-drag-region>{label}</span>
+        <span className="floatbar__pct" data-tauri-drag-region>{value}</span>
       </span>
+      {showResetInline && countdown && (
+        <span className="floatbar__reset" title={resetText ?? undefined} aria-label={resetText ?? undefined} data-tauri-drag-region>
+          <svg width={Math.round(10 * scale)} height={Math.round(10 * scale)} viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <circle cx="8" cy="8" r="6" stroke="currentColor" strokeWidth="1.5" />
+            <path d="M8 4v4l2.5 1.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+          </svg>
+          <span className="floatbar__reset-time" data-tauri-drag-region>{countdown}</span>
+        </span>
+      )}
+    </div>
+  );
+}
+
+function ProviderPill(props: QuotaPresentationProps) {
+  const { provider, scale } = props;
+  const windows = quotaWindows(provider);
+  if (!windows) return null;
+  const brand = getProviderIcon(provider.providerId).brandColor;
+  return (
+    <div className="floatbar__pill" data-tauri-drag-region style={{ "--brand": brand } as CSSProperties}>
+      <span className="floatbar__identity" data-tauri-drag-region>
+        <span className="floatbar__provider-icon" data-tauri-drag-region>
+          <ProviderIcon providerId={provider.providerId} size={Math.round(13 * scale)} />
+        </span>
+        <span data-tauri-drag-region>{provider.displayName}</span>
+      </span>
+      {windows.session ? <QuotaMetric {...props} rateWindow={windows.session} label="5h" /> : <span />}
+      {windows.weekly ? <QuotaMetric {...props} rateWindow={windows.weekly} label="Weekly" /> : <span />}
     </div>
   );
 }
@@ -235,7 +242,7 @@ function ProviderPill({
 /**
  * The always-on-top floating capacity bar.
  *
- * Renders a tiny strip of provider pills. Listens to the same provider
+ * Renders stacked provider rows with session and weekly quota columns. Listens to the same provider
  * refresh cycle as the rest of the app via `useProviders`, and reacts to
  * setting changes (filter list, orientation) live without a reload.
  */
@@ -245,8 +252,40 @@ export default function FloatBar({ state }: { state: BootstrapState }) {
     refreshOnMount: false,
   });
   const startDrag = useCallback((event: MouseEvent<HTMLElement>) => {
-    if (event.button !== 0) return;
+    if (event.button !== 0 || (event.target as HTMLElement).closest("button")) return;
     void getCurrentWindow().startDragging().catch(() => {});
+  }, []);
+
+  const manualRefreshRef = useRef(false);
+  const cycleActiveRef = useRef(false);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  useEffect(() => {
+    const started = listen("refresh-started", () => {
+      cycleActiveRef.current = true;
+      setIsRefreshing(true);
+    });
+    const complete = listen("refresh-complete", () => {
+      cycleActiveRef.current = false;
+      setIsRefreshing(manualRefreshRef.current);
+    });
+    return () => {
+      void started.then((fn) => fn());
+      void complete.then((fn) => fn());
+    };
+  }, []);
+  const refreshAll = useCallback(async () => {
+    if (manualRefreshRef.current || cycleActiveRef.current) return;
+    manualRefreshRef.current = true;
+    setIsRefreshing(true);
+    try {
+      await refreshProviders();
+    } catch {
+      // A failed command may never emit refresh-complete.
+      cycleActiveRef.current = false;
+    } finally {
+      manualRefreshRef.current = false;
+      setIsRefreshing(cycleActiveRef.current);
+    }
   }, []);
 
   // Mark the body so our CSS can strip the dark theme background — the
@@ -271,7 +310,7 @@ export default function FloatBar({ state }: { state: BootstrapState }) {
   // The detached floatbar should keep usage fresh, but it must not open or
   // focus any other surface. Refresh data only; provider-updated events feed
   // this window when the backend completes. Respect Low Power Mode's 30-min
-  // floor for automatic ticks (manual refresh stays elsewhere/immediate).
+  // floor for automatic ticks (manual refresh remains immediate).
   useEffect(() => {
     const baseMs = Math.max(60_000, settings.refreshIntervalSecs * 1000);
     const intervalMs = settings.lowPowerMode
@@ -314,6 +353,8 @@ export default function FloatBar({ state }: { state: BootstrapState }) {
         b.selectedMetric.usedPercent - a.selectedMetric.usedPercent,
     );
   }, [providers, settings.enabledProviders, filterIds]);
+
+  const quotaProviders = visible.filter((provider) => quotaWindows(provider) !== null);
 
   const visibleCostTargets = useMemo<FloatBarCostTarget[]>(
     () =>
@@ -446,8 +487,7 @@ export default function FloatBar({ state }: { state: BootstrapState }) {
 
   return (
     <div
-      role="button"
-      tabIndex={-1}
+      role="group"
       aria-label={t("AppName")}
       className={`floatbar floatbar--${orientation} floatbar--${style}${settings.floatBarDarkText ? " floatbar--light-bg" : ""}`}
       data-tauri-drag-region
@@ -460,37 +500,46 @@ export default function FloatBar({ state }: { state: BootstrapState }) {
       }
     >
       <div className="floatbar__handle" data-tauri-drag-region aria-hidden />
-      {visible.length === 0 ? (
+      {quotaProviders.length === 0 ? (
         <div className="floatbar__empty" data-tauri-drag-region>
           {t("FloatBarNoProviders")}
         </div>
       ) : (
         <>
-          {visible.map((p) => (
-            <ProviderPill
-              key={providerCostKey(p)}
-              provider={p}
-              highRemaining={highRemaining}
-              critRemaining={critRemaining}
-              showAsUsed={settings.showAsUsed}
-              scale={scale}
-              showResetInline={showResetInline}
-              resetRelative={settings.resetTimeRelative}
-              usedSuffix={t("PanelUsedSuffix")}
-              remainingSuffix={t("FloatBarRemainingSuffix")}
-            />
-          ))}
-          {visibleCosts.map((summary) => (
-            <CostPill
-              key={`cost:${summary.key}`}
-              summary={summary}
-              scale={scale}
-              todayLabel={t("PanelToday")}
-              thirtyDayLabel={t("FloatBarThirtyDayShort")}
-            />
-          ))}
+          <div className="floatbar__providers" data-tauri-drag-region>
+            {quotaProviders.map((p) => (
+              <ProviderPill
+                key={providerCostKey(p)}
+                provider={p}
+                highRemaining={highRemaining}
+                critRemaining={critRemaining}
+                showAsUsed={settings.showAsUsed}
+                scale={scale}
+                showResetInline={showResetInline}
+                usedSuffix={t("PanelUsedSuffix")}
+                remainingSuffix={t("FloatBarRemainingSuffix")}
+              />
+            ))}
+          </div>
         </>
       )}
+      {visibleCosts.map((summary) => (
+        <CostPill
+          key={`cost:${summary.key}`}
+          summary={summary}
+          scale={scale}
+          todayLabel={t("PanelToday")}
+          thirtyDayLabel={t("FloatBarThirtyDayShort")}
+        />
+      ))}
+      <button type="button" className="floatbar__refresh" disabled={isRefreshing}
+        aria-label={t("ActionRefreshAll")} title={t("ActionRefreshAll")} aria-busy={isRefreshing}
+        onPointerDown={(event) => event.stopPropagation()}
+        onMouseDown={(event) => event.stopPropagation()}
+        onClick={() => void refreshAll()}>
+        <ResetIcon size={Math.round(12 * scale)} />
+        <span>{isRefreshing ? t("SummaryRefreshing") : t("ActionRefreshAll")}</span>
+      </button>
     </div>
   );
 }

@@ -1,4 +1,4 @@
-import { act, render, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const tauriMocks = vi.hoisted(() => ({
@@ -15,6 +15,7 @@ const tauriMocks = vi.hoisted(() => ({
 
 const eventMocks = vi.hoisted(() => ({
   listen: vi.fn(),
+  listeners: new Map<string, Array<(event: { payload: unknown }) => void>>(),
 }));
 
 const windowMocks = vi.hoisted(() => ({
@@ -220,13 +221,21 @@ describe("FloatBar", () => {
         ResetsInDaysHours: "Resets in {}d {}h",
         TrayResetsDueNow: "Resetting",
         PanelToday: "Today",
+        ActionRefreshAll: "Refresh all",
+        SummaryRefreshing: "Refreshing",
         PanelUsedSuffix: "used",
         FloatBarThirtyDayShort: "30d",
         FloatBarNoProviders: "No providers",
         FloatBarRemainingSuffix: "remaining",
       }),
     );
-    eventMocks.listen.mockResolvedValue(() => {});
+    eventMocks.listeners.clear();
+    eventMocks.listen.mockImplementation((event: string, handler: (event: { payload: unknown }) => void) => {
+      const listeners = eventMocks.listeners.get(event) ?? [];
+      listeners.push(handler);
+      eventMocks.listeners.set(event, listeners);
+      return Promise.resolve(() => {});
+    });
   });
 
   it("renders a pill per enabled provider, sorted by usage descending", async () => {
@@ -244,15 +253,15 @@ describe("FloatBar", () => {
       expect(pills.length).toBe(2);
     });
 
-    const titles = Array.from(container.querySelectorAll(".floatbar__pill")).map(
+    const titles = Array.from(container.querySelectorAll(".floatbar__quota")).map(
       (el) => el.getAttribute("title") ?? "",
     );
     // Highest used (codex, 75%) shows first; display follows showAsUsed.
-    expect(titles[0]).toMatch(/Codex: 75% used/);
-    expect(titles[1]).toMatch(/Claude: 20% used/);
+    expect(titles[0]).toMatch(/Codex: 5h 75% used/);
+    expect(titles[1]).toMatch(/Claude: 5h 20% used/);
   });
 
-  it("uses the selected session window when a weekly window is available", async () => {
+  it("renders session even when a weekly window is available", async () => {
     tauriMocks.getCachedProviders.mockResolvedValue([
       snapshot("claude", "Claude", 20, { secondary: { used: 90 } }),
     ]);
@@ -264,13 +273,13 @@ describe("FloatBar", () => {
       bootstrap({ providerMetrics: { claude: "session" } }),
     );
     await waitFor(() => {
-      expect(container.querySelector(".floatbar__pill")?.getAttribute("title")).toContain(
-        "Claude: 20% used",
+      expect(container.querySelector(".floatbar__quota")?.getAttribute("title")).toContain(
+        "Claude: 5h 20% used",
       );
     });
   });
 
-  it("uses the selected weekly window in the floating bar", async () => {
+  it("shows only real weekly data when the session is informational", async () => {
     tauriMocks.getCachedProviders.mockResolvedValue([
       snapshot("codex", "Codex", 0, {
         informational: true,
@@ -286,8 +295,8 @@ describe("FloatBar", () => {
       bootstrap({ providerMetrics: { codex: "weekly" } }),
     );
     await waitFor(() => {
-      expect(container.querySelector(".floatbar__pill")?.getAttribute("title")).toContain(
-        "Codex: 37% used",
+      expect(container.querySelector(".floatbar__quota")?.getAttribute("title")).toContain(
+        "Codex: Weekly 37% used",
       );
     });
   });
@@ -309,65 +318,32 @@ describe("FloatBar", () => {
 
     const { container } = renderFloatBar(bootstrap({ floatBarShowResetInline: true }));
     await waitFor(() => {
-      const pill = container.querySelector(".floatbar__pill");
-      expect(pill?.getAttribute("title")).toContain("Claude: 80% used\nResets in 2 hours");
-      expect(pill?.classList.contains("floatbar__pill--warn")).toBe(true);
+      const pill = container.querySelector(".floatbar__quota");
+      expect(pill?.getAttribute("title")).toContain("Claude: Weekly 80% used\nResets in 2 hours");
+      expect(pill?.classList.contains("floatbar__quota--warn")).toBe(true);
       expect(container.querySelector(".floatbar__reset")?.textContent).toContain("2 hours");
     });
   });
 
-  it("keeps an informational primary window when no secondary window is available", async () => {
+  it("omits informational placeholders when neither quota is real", async () => {
     tauriMocks.getCachedProviders.mockResolvedValue([
       snapshot("claude", "Claude", 10, { informational: true }),
+      snapshot("codex", "Codex", 10, { informational: true, secondary: { used: 90, informational: true } }),
     ]);
-    tauriMocks.getSettingsSnapshot.mockResolvedValue(settings());
-
     const { container } = renderFloatBar(bootstrap());
-    await waitFor(() => {
-      expect(container.querySelector(".floatbar__pill")?.getAttribute("title")).toContain(
-        "Claude: 10% used",
-      );
-    });
+    await waitFor(() => expect(tauriMocks.getCachedProviders).toHaveBeenCalled());
+    expect(container.querySelectorAll(".floatbar__quota")).toHaveLength(0);
   });
 
-  it("keeps an informational primary window when the secondary window is informational", async () => {
+  it("keeps the existing provider ordering while showing both actual windows", async () => {
     tauriMocks.getCachedProviders.mockResolvedValue([
-      snapshot("claude", "Claude", 10, {
-        informational: true,
-        secondary: { used: 90, informational: true },
-      }),
-    ]);
-    tauriMocks.getSettingsSnapshot.mockResolvedValue(settings());
-
-    const { container } = renderFloatBar(bootstrap());
-    await waitFor(() => {
-      expect(container.querySelector(".floatbar__pill")?.getAttribute("title")).toContain(
-        "Claude: 10% used",
-      );
-    });
-  });
-
-  it("sorts providers by their selected rate window", async () => {
-    tauriMocks.getCachedProviders.mockResolvedValue([
-      snapshot("claude", "Claude", 90, {
-        secondary: { used: 20 },
-        selected: { used: 20 },
-      }),
+      snapshot("claude", "Claude", 90, { secondary: { used: 20 }, selected: { used: 20 } }),
       snapshot("codex", "Codex", 50),
     ]);
-    tauriMocks.getSettingsSnapshot.mockResolvedValue(
-      settings({ providerMetrics: { claude: "weekly" } }),
-    );
-
-    const { container } = renderFloatBar(
-      bootstrap({ providerMetrics: { claude: "weekly" } }),
-    );
-    await waitFor(() => {
-      const titles = Array.from(container.querySelectorAll(".floatbar__pill")).map(
-        (pill) => pill.getAttribute("title"),
-      );
-      expect(titles).toEqual(["Codex: 50% used", "Claude: 20% used"]);
-    });
+    const { container } = renderFloatBar(bootstrap());
+    await waitFor(() => expect(container.querySelectorAll(".floatbar__identity")).toHaveLength(2));
+    expect(Array.from(container.querySelectorAll(".floatbar__identity")).map((row) => row.textContent?.trim())).toEqual(["Codex", "Claude"]);
+    expect(container.querySelectorAll(".floatbar__quota")).toHaveLength(3);
   });
 
   it("loads local cost summaries without using the foreground chart endpoint", async () => {
@@ -417,9 +393,9 @@ describe("FloatBar", () => {
 
     await waitFor(() => {
       const title = container
-        .querySelector(".floatbar__pill")
+        .querySelector(".floatbar__quota")
         ?.getAttribute("title");
-      expect(title).toContain("Claude: 80% remaining");
+      expect(title).toContain("Claude: 5h 80% remaining");
     });
   });
 
@@ -432,7 +408,7 @@ describe("FloatBar", () => {
 
     const { container } = renderFloatBar(bootstrap());
     await waitFor(() => {
-      expect(container.querySelector(".floatbar__pill--warn")).not.toBeNull();
+      expect(container.querySelector(".floatbar__quota--warn")).not.toBeNull();
     });
   });
 
@@ -444,7 +420,7 @@ describe("FloatBar", () => {
 
     const { container } = renderFloatBar(bootstrap());
     await waitFor(() => {
-      expect(container.querySelector(".floatbar__pill--crit")).not.toBeNull();
+      expect(container.querySelector(".floatbar__quota--crit")).not.toBeNull();
     });
   });
 
@@ -463,7 +439,7 @@ describe("FloatBar", () => {
     await waitFor(() => {
       const pills = container.querySelectorAll(".floatbar__pill");
       expect(pills.length).toBe(1);
-      expect(pills[0].getAttribute("title")).toMatch(/Codex/);
+      expect(pills[0].textContent).toMatch(/Codex/);
     });
   });
 
@@ -575,9 +551,9 @@ describe("FloatBar", () => {
 
     await waitFor(() => {
       const title = container
-        .querySelector(".floatbar__pill")
+        .querySelector(".floatbar__quota")
         ?.getAttribute("title");
-      expect(title).toContain("Claude: 20% used");
+      expect(title).toContain("Claude: 5h 20% used");
       expect(title).toMatch(/Resets in 3h 4[12]m/);
       expect(title).not.toContain("Resets in due now");
     });
@@ -632,4 +608,172 @@ describe("FloatBar", () => {
       vi.useRealTimers();
     }
   });
+  it.each([true, false])("renders session left of weekly with independent values (showAsUsed=%s)", async (showAsUsed) => {
+    tauriMocks.getCachedProviders.mockResolvedValue([
+      snapshot("codex", "Codex", 96, { secondary: { used: 24 }, selected: { used: 24 } }),
+      snapshot("claude", "Claude", 25, { secondary: { used: 40 } }),
+    ]);
+    const { container } = renderFloatBar(bootstrap({ showAsUsed }));
+    await waitFor(() => expect(container.querySelectorAll(".floatbar__pill")).toHaveLength(2));
+    const codex = Array.from(container.querySelectorAll(".floatbar__pill")).find((row) => row.textContent?.includes("Codex"))!;
+    const quotas = codex.querySelectorAll(".floatbar__quota");
+    expect(quotas).toHaveLength(2);
+    expect(quotas[0].textContent).toBe(`5h${showAsUsed ? 96 : 4}%`);
+    expect(quotas[1].textContent).toBe(`Weekly${showAsUsed ? 24 : 76}%`);
+    expect(quotas[0]).toHaveClass("floatbar__quota--crit");
+    expect(quotas[1]).toHaveClass("floatbar__quota--ok");
+    expect(codex).not.toHaveClass("floatbar__quota--crit");
+  });
+
+  it("uses each window's own reset and hides only countdowns when disabled", async () => {
+    const weeklyReset = new Date(Date.now() + 6 * 24 * 60 * 60_000 + 14 * 60 * 60_000).toISOString();
+    tauriMocks.getCachedProviders.mockResolvedValue([
+      snapshot("claude", "Claude", 25, {
+        resetDescription: "Resets in 4h57m",
+        secondary: { used: 24, resetsAt: weeklyReset, resetDescription: "Wrong description" },
+      }),
+    ]);
+    const view = renderFloatBar(bootstrap({ floatBarShowResetInline: true, resetTimeRelative: false }));
+    await waitFor(() => expect(view.container.querySelectorAll(".floatbar__reset")).toHaveLength(2));
+    const resets = view.container.querySelectorAll(".floatbar__reset");
+    expect(resets[0].textContent).toBe("4h57m");
+    expect(resets[1].textContent).toMatch(/6d 1[34]h/);
+    view.rerender(<LocaleProvider><FloatBar state={bootstrap({ floatBarShowResetInline: false })} /></LocaleProvider>);
+    expect(view.container.querySelectorAll(".floatbar__reset")).toHaveLength(0);
+    expect(view.container.querySelectorAll(".floatbar__quota")).toHaveLength(2);
+    expect(view.container.querySelectorAll(".floatbar__pct")[1].textContent).toBe("24%");
+  });
+
+  it("does not fabricate weekly data or relabel Tokens/MCP windows", async () => {
+    const unrelated = snapshot("codex", "Codex", 20, { secondary: { used: 30 } });
+    unrelated.primaryLabel = "Tokens";
+    unrelated.secondaryLabel = "MCP";
+    tauriMocks.getCachedProviders.mockResolvedValue([
+      unrelated,
+      snapshot("claude", "Claude", 25),
+      snapshot("zai", "Z.ai", 40, { secondary: { used: 60 } }),
+    ]);
+    const { container } = renderFloatBar(bootstrap({ enabledProviders: ["codex", "claude", "zai"] }));
+    await waitFor(() => expect(container.querySelectorAll(".floatbar__pill")).toHaveLength(1));
+    expect(container.querySelector(".floatbar__identity")?.textContent?.trim()).toBe("Claude");
+    expect(container.querySelectorAll(".floatbar__quota")).toHaveLength(1);
+    expect(screen.queryByText("Weekly")).not.toBeInTheDocument();
+  });
+
+  it("rejects unrelated window durations even for an agent provider", async () => {
+    const unrelated = snapshot("codex", "Codex", 20, { secondary: { used: 30 } });
+    unrelated.primary.windowMinutes = 60;
+    unrelated.secondary!.windowMinutes = 43_200;
+    tauriMocks.getCachedProviders.mockResolvedValue([unrelated]);
+    const { container } = renderFloatBar(bootstrap());
+    await waitFor(() => expect(tauriMocks.getCachedProviders).toHaveBeenCalled());
+    expect(container.querySelectorAll(".floatbar__quota")).toHaveLength(0);
+  });
+
+  it("refreshes immediately without overlapping clicks or dragging", async () => {
+    let complete!: () => void;
+    tauriMocks.refreshProviders.mockImplementation(() => new Promise<void>((resolve) => { complete = resolve; }));
+    tauriMocks.getCachedProviders.mockResolvedValue([]);
+    renderFloatBar(bootstrap());
+    const button = await screen.findByRole("button", { name: "Refresh all" });
+    windowMocks.getCurrentWindow.mockClear();
+    fireEvent.pointerDown(button);
+    fireEvent.mouseDown(button, { button: 0 });
+    fireEvent.click(button);
+    fireEvent.click(button);
+    expect(tauriMocks.refreshProviders).toHaveBeenCalledTimes(1);
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute("aria-busy", "true");
+    expect(button).not.toHaveAttribute("data-tauri-drag-region");
+    expect(windowMocks.getCurrentWindow).not.toHaveBeenCalled();
+    await act(async () => complete());
+    expect(button).toBeEnabled();
+    fireEvent.mouseDown(document.querySelector(".floatbar__handle")!, { button: 0 });
+    expect(windowMocks.getCurrentWindow).toHaveBeenCalledTimes(1);
+  });
+
+  it("disables manual refresh throughout an event-driven automatic cycle", async () => {
+    tauriMocks.getCachedProviders.mockResolvedValue([]);
+    renderFloatBar(bootstrap());
+    const button = await screen.findByRole("button", { name: "Refresh all" });
+    const emit = (name: string, payload: unknown = {}) => {
+      for (const listener of eventMocks.listeners.get(name) ?? []) listener({ payload });
+    };
+    act(() => emit("refresh-started", { providerIds: ["codex"] }));
+    fireEvent.click(button);
+    expect(button).toBeDisabled();
+    expect(tauriMocks.refreshProviders).not.toHaveBeenCalled();
+    // A provider update does not complete the global cycle.
+    act(() => emit("provider-updated", snapshot("codex", "Codex", 20)));
+    expect(button).toBeDisabled();
+    act(() => emit("refresh-complete", { providerCount: 1, errorCount: 0 }));
+    expect(button).toBeEnabled();
+  });
+
+  it.each([false, true])("recovers the refresh button after command failure (started=%s)", async (started) => {
+    tauriMocks.getCachedProviders.mockResolvedValue([]);
+    tauriMocks.refreshProviders.mockImplementation(async () => {
+      if (started) {
+        for (const listener of eventMocks.listeners.get("refresh-started") ?? []) {
+          listener({ payload: { providerIds: ["codex"] } });
+        }
+      }
+      throw new Error("command unavailable");
+    });
+    renderFloatBar(bootstrap());
+    const button = await screen.findByRole("button", { name: "Refresh all" });
+    fireEvent.click(button);
+    await waitFor(() => expect(button).toBeEnabled());
+    expect(tauriMocks.refreshProviders).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the low-power automatic cadence and vertical orientation", async () => {
+    vi.useFakeTimers();
+    try {
+      tauriMocks.getCachedProviders.mockResolvedValue([]);
+      await act(async () => { renderFloatBar(bootstrap({ refreshIntervalSecs: 60, lowPowerMode: true, floatBarOrientation: "vertical", floatBarStyle: "taskbar" })); });
+      expect(document.querySelector(".floatbar")).toHaveClass("floatbar--vertical", "floatbar--taskbar");
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(tauriMocks.refreshProvidersIfStale).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(29 * 60_000);
+      expect(tauriMocks.refreshProvidersIfStale).toHaveBeenCalledTimes(2);
+      expect(tauriMocks.refreshProviders).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("observes wider quota content and remeasures after a DPI change", async () => {
+    tauriMocks.getCachedProviders.mockResolvedValue([snapshot("codex", "Codex", 40, { secondary: { used: 25 } })]);
+    let resize!: ResizeObserverCallback;
+    const observe = vi.fn();
+    const disconnect = vi.fn();
+    vi.stubGlobal("ResizeObserver", class {
+      constructor(callback: ResizeObserverCallback) { resize = callback; }
+      observe = observe;
+      disconnect = disconnect;
+    });
+    let width = 420;
+    const rectSpy = vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(() => ({
+      x: 0, y: 0, width, height: 80, top: 0, right: width, bottom: 80, left: 0, toJSON: () => ({}),
+    }));
+    const originalDpr = window.devicePixelRatio;
+    Object.defineProperty(window, "devicePixelRatio", { configurable: true, value: 1 });
+    try {
+      const view = renderFloatBar(bootstrap());
+      await waitFor(() => expect(coreMocks.invoke).toHaveBeenCalledWith("resize_float_bar", { width: 428, height: 88 }));
+      expect(observe).toHaveBeenCalledWith(view.container.querySelector(".floatbar"));
+      width = 640;
+      act(() => resize([], {} as ResizeObserver));
+      await waitFor(() => expect(coreMocks.invoke).toHaveBeenCalledWith("resize_float_bar", { width: 648, height: 88 }));
+      Object.defineProperty(window, "devicePixelRatio", { configurable: true, value: 1.5 });
+      fireEvent(window, new Event("resize"));
+      await waitFor(() => expect(coreMocks.invoke).toHaveBeenCalledWith("resize_float_bar", { width: 972, height: 132 }));
+      view.unmount();
+      expect(disconnect).toHaveBeenCalled();
+    } finally {
+      rectSpy.mockRestore();
+      vi.unstubAllGlobals();
+      Object.defineProperty(window, "devicePixelRatio", { configurable: true, value: originalDpr });
+    }
+  });
+
 });
