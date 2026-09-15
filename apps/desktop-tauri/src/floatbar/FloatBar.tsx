@@ -154,6 +154,15 @@ function CostPill({
 // Only these providers own the subscription session/weekly lane contract.
 // Informational placeholders must never become fabricated quota percentages.
 function quotaWindows(provider: ProviderUsageSnapshot) {
+  if (provider.providerId === "zai") {
+    // A single Z.ai token window can be either 5-hour or weekly primary.
+    const real = [provider.primary, provider.secondary].filter(
+      (window): window is RateWindowSnapshot => Boolean(window && !window.isInformational),
+    );
+    const session = real.find((window) => window.windowMinutes === 300) ?? null;
+    const weekly = real.find((window) => window.windowMinutes === 10_080) ?? null;
+    return session || weekly ? { session, weekly } : null;
+  }
   if (provider.providerId !== "codex" && provider.providerId !== "claude") return null;
   const session = !provider.primary.isInformational &&
     provider.primary.windowMinutes === 300
@@ -220,12 +229,12 @@ function ProviderPill(props: QuotaPresentationProps) {
   const { t } = useLocale();
   const { provider, scale } = props;
   const windows = quotaWindows(provider);
-  const agent = provider.providerId === "codex" || provider.providerId === "claude";
-  const first = agent ? windows?.session ?? null : provider.selectedMetric;
+  const labeled = provider.providerId === "codex" || provider.providerId === "claude" || windows != null;
+  const first = labeled ? windows?.session ?? null : provider.selectedMetric;
   const second = windows?.weekly ?? null;
   const firstReset = useFormattedResetTime(first?.resetsAt ?? null, first?.resetDescription ?? null, props.resetRelative);
   const secondReset = useFormattedResetTime(second?.resetsAt ?? null, second?.resetDescription ?? null, props.resetRelative);
-  const firstLabel = agent ? t("ProviderSessionLabel") : "";
+  const firstLabel = labeled ? t("ProviderSessionLabel") : "";
   const secondLabel = t("ProviderWeeklyLabel");
   const suffix = props.showAsUsed ? props.usedSuffix : props.remainingSuffix;
   const describe = (window: RateWindowSnapshot | null, label: string, reset: string | null) => {

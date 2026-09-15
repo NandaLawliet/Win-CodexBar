@@ -128,6 +128,17 @@ function snapshot(
   };
 }
 
+function zaiSnapshot(): ProviderUsageSnapshot {
+  const provider = snapshot("zai", "z.ai", 0, {
+    resetDescription: "5-hour",
+    secondary: { used: 98.6, resetDescription: "Weekly" },
+  });
+  delete provider.primaryLabel;
+  delete provider.secondaryLabel;
+  provider.selectedMetric = provider.secondary!;
+  return provider;
+}
+
 function settings(overrides: Partial<SettingsSnapshot> = {}): SettingsSnapshot {
   return {
     enabledProviders: ["claude", "codex"],
@@ -704,6 +715,7 @@ describe("FloatBar", () => {
 
   it.each(["gemini", "copilot", "cursor", "zai"])("keeps %s selected-metric fallback without fake quota labels", async (id) => {
     const provider = snapshot(id, id, 20, { selected: { used: 64, resetDescription: "Resets tomorrow" } });
+    if (id === "zai") provider.primary.windowMinutes = null;
     provider.primaryLabel = "Tokens";
     tauriMocks.getCachedProviders.mockResolvedValue([provider]);
     const { container } = renderFloatBar(bootstrap({ enabledProviders: [id] }));
@@ -713,6 +725,81 @@ describe("FloatBar", () => {
     expect(screen.queryByText("Weekly")).not.toBeInTheDocument();
     expect(screen.queryByText("Session")).not.toBeInTheDocument();
     expect(screen.queryByText("No providers")).not.toBeInTheDocument();
+  });
+
+  it.each([true, false])("renders Z.ai semantic lanes with independent values and tones (showAsUsed=%s)", async (showAsUsed) => {
+    tauriMocks.getCachedProviders.mockResolvedValue([zaiSnapshot()]);
+    const { container } = renderFloatBar(bootstrap({ enabledProviders: ["zai"], showAsUsed }));
+    await waitFor(() => expect(container.querySelectorAll(".floatbar__quota")).toHaveLength(2));
+    const quotas = container.querySelectorAll(".floatbar__quota");
+    expect(quotas[0].textContent).toBe(`Session${showAsUsed ? 0 : 100}%`);
+    expect(quotas[1].textContent).toBe(`Weekly${showAsUsed ? 99 : 1}%`);
+    expect(quotas[0]).toHaveClass("floatbar__quota--ok");
+    expect(quotas[1]).toHaveClass("floatbar__quota--crit");
+    expect(container.querySelector(".floatbar__pill")).not.toHaveClass("floatbar__quota--crit");
+  });
+
+  it.each(["timestamp", "description"])("associates Z.ai resets with their own lanes (%s)", async (source) => {
+    const provider = zaiSnapshot();
+    if (source === "timestamp") {
+      provider.primary.resetsAt = new Date(Date.now() + (4 * 60 + 30) * 60_000).toISOString();
+      provider.secondary!.resetsAt = new Date(Date.now() + (24 + 17) * 60 * 60_000).toISOString();
+    } else {
+      provider.primary.resetDescription = "Resets in 4h 30m";
+      provider.secondary!.resetDescription = "Resets in 1d 17h";
+    }
+    tauriMocks.getCachedProviders.mockResolvedValue([provider]);
+    const { container } = renderFloatBar(bootstrap({ enabledProviders: ["zai"], floatBarShowResetInline: true }));
+    await waitFor(() => expect(container.querySelectorAll(".floatbar__reset")).toHaveLength(2));
+    const quotas = container.querySelectorAll(".floatbar__quota");
+    expect(quotas[0].querySelector(".floatbar__reset-time")?.textContent).toMatch(/4h (29|30)m/);
+    expect(quotas[1].querySelector(".floatbar__reset-time")?.textContent).toMatch(/1d (16|17)h/);
+    expect(quotas[0].getAttribute("title")).toContain("Session 0% used\nResets in 4h");
+    expect(quotas[1].getAttribute("title")).toContain("Weekly 99% used\nResets in 1d");
+    const title = container.querySelector(".floatbar__pill")?.getAttribute("title");
+    expect(title).toContain(quotas[0].getAttribute("title")!.replace("z.ai: ", ""));
+    expect(title).toContain(quotas[1].getAttribute("title")!.replace("z.ai: ", ""));
+  });
+
+  it.each([300, 10_080])("does not fabricate Z.ai's missing lane with a single %s-minute token window", async (duration) => {
+    const provider = zaiSnapshot();
+    provider.primary = duration === 300 ? provider.primary : provider.secondary!;
+    provider.secondary = null;
+    provider.selectedMetric = provider.primary;
+    tauriMocks.getCachedProviders.mockResolvedValue([provider]);
+    const { container } = renderFloatBar(bootstrap({ enabledProviders: ["zai"] }));
+    await waitFor(() => expect(container.querySelectorAll(".floatbar__quota")).toHaveLength(1));
+    expect(container.querySelector(".floatbar__quota")?.textContent).toBe(duration === 300 ? "Session0%" : "Weekly99%");
+    expect(screen.queryByText(duration === 300 ? "Weekly" : "Session")).not.toBeInTheDocument();
+  });
+
+  it("keeps Z.ai unrelated durations on the truthful selected-metric fallback", async () => {
+    const provider = zaiSnapshot();
+    provider.primary.windowMinutes = 60;
+    provider.secondary!.windowMinutes = 43_200;
+    tauriMocks.getCachedProviders.mockResolvedValue([provider]);
+    const { container } = renderFloatBar(bootstrap({ enabledProviders: ["zai"] }));
+    await waitFor(() => expect(container.querySelectorAll(".floatbar__quota")).toHaveLength(1));
+    expect(container.querySelector(".floatbar__quota")?.textContent).toBe("99%");
+    expect(screen.queryByText("Session")).not.toBeInTheDocument();
+    expect(screen.queryByText("Weekly")).not.toBeInTheDocument();
+  });
+
+  it.each(["session", "weekly", "both"])("does not promote Z.ai informational quota placeholders (%s)", async (placeholder) => {
+    const provider = zaiSnapshot();
+    provider.primary.isInformational = placeholder !== "weekly";
+    provider.secondary!.isInformational = placeholder !== "session";
+    provider.selectedMetric = provider.primary.isInformational ? provider.secondary! : provider.primary;
+    tauriMocks.getCachedProviders.mockResolvedValue([provider]);
+    const { container } = renderFloatBar(bootstrap({ enabledProviders: ["zai"] }));
+    if (placeholder === "both") {
+      await screen.findByText("No providers");
+      expect(container.querySelectorAll(".floatbar__quota")).toHaveLength(0);
+    } else {
+      await waitFor(() => expect(container.querySelectorAll(".floatbar__quota")).toHaveLength(1));
+      expect(container.querySelector(".floatbar__quota")?.textContent).toBe(placeholder === "session" ? "Weekly99%" : "Session0%");
+      expect(screen.queryByText(placeholder === "session" ? "Session" : "Weekly")).not.toBeInTheDocument();
+    }
   });
 
   it("keeps reset tooltip on the hit-testable pill with inline reset disabled", async () => {
