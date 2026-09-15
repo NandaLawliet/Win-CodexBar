@@ -816,3 +816,7 @@ OpenRouterManagementKeyTitle = OpenRouter spend history
 OpenRouterManagementKeyLabel = Management API key
 OpenRouterManagementKeyHelp = Optional. Used only for exact 30-day Activity spend from openrouter.ai. The primary OpenRouter API key remains separate. You can also set OPENROUTER_MANAGEMENT_API_KEY.
 OpenRouterManagementKeyConfigured = Management key configured
+
+TrayFooterHide = Hide { "{}" }
+TrayFooterShow = Show { "{}" }
+TrayFooterEditVisibility = Edit footer visibility

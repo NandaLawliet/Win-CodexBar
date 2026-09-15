@@ -228,7 +228,8 @@ impl CodexApi {
         let access_token = tokens
             .get("access_token")
             .and_then(|v| v.as_str())
-            .filter(|s| !s.trim().is_empty())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
             .ok_or_else(|| {
                 ProviderError::Parse("Missing access_token in Codex credentials".to_string())
             })?
@@ -1117,7 +1118,7 @@ mod tests {
         let credentials = CodexApi::parse_credentials_json(
             r#"{
                 "tokens": {
-                    "access_token": "access",
+                    "access_token": "  access  ",
                     "refresh_token": "refresh",
                     "account_id": "acct_123"
                 }

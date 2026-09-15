@@ -468,6 +468,9 @@ locale_keys! {
     Account,
 
     // Provider detail - Usage section
+    TrayFooterHide,
+    TrayFooterShow,
+    TrayFooterEditVisibility,
     ProviderSessionLabel,
     ProviderWeeklyLabel,
     ProviderCodeReviewLabel,

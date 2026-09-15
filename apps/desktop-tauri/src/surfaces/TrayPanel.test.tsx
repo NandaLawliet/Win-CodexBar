@@ -248,6 +248,9 @@ describe("TrayPanel provider grid", () => {
       buildBundle({
         ActionRefresh: "Refresh",
         MenuAbout: "About CodexBar",
+        TrayFooterHide: "Hide {}",
+        TrayFooterShow: "Show {}",
+        TrayFooterEditVisibility: "Edit footer visibility",
         MenuQuit: "Quit",
         MenuSettings: "Settings...",
         PanelAllProviders: "All providers",
@@ -912,6 +915,19 @@ describe("TrayPanel provider grid", () => {
     expect(document.querySelector(".update-banner")).toBeNull();
     expect(tauriMocks.getUpdateState).not.toHaveBeenCalled();
     expect(tauriMocks.downloadUpdate).not.toHaveBeenCalled();
+  });
+
+  it.each([null, '{"zoom":true,"settings":true,"about":true,"quit":true}', '{"quit":true,"about":true,"settings":true,"zoom":true}', '{"zoom":true}'])
+    ("does not rewrite visibility storage on clean mounts or edit toggles: %s", async (stored) => {
+      if (stored !== null) localStorage.setItem("codexbar.trayFooterVisibility.v1", stored);
+      const write = vi.spyOn(Storage.prototype, "setItem");
+      try {
+        renderTrayPanel([]);
+        const editor = await screen.findByRole("button", { name: "Edit footer visibility" });
+        fireEvent.click(editor);
+        fireEvent.click(editor);
+        expect(write).not.toHaveBeenCalled();
+      } finally { write.mockRestore(); }
   });
 
   it("defaults all optional footer items visible and keeps Refresh final", async () => {

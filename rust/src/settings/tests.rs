@@ -1,6 +1,17 @@
 use super::*;
 
 #[test]
+fn deprecated_codex_external_oauth_setting_remains_compatible() {
+    for allowed in [false, true] {
+        let json = serde_json::json!({ "codex_external_oauth_sources_allowed": allowed });
+        let settings: Settings = serde_json::from_value(json).unwrap();
+        assert_eq!(settings.codex_external_oauth_sources_allowed, allowed);
+        let saved = serde_json::to_value(&settings).unwrap();
+        assert_eq!(saved["codex_external_oauth_sources_allowed"], allowed);
+    }
+}
+
+#[test]
 fn test_settings_default() {
     let settings = Settings::default();
     assert!(settings.enabled_providers.contains("claude"));

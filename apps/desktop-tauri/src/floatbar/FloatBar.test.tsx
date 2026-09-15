@@ -97,6 +97,8 @@ function snapshot(
   const secondary = opts.secondary
     ? rateWindow(opts.secondary.used, opts.secondary)
     : null;
+  primary.windowMinutes = 300;
+  if (secondary) secondary.windowMinutes = 10_080;
   const selectedMetric = opts.selected
     ? rateWindow(opts.selected.used, opts.selected)
     : primary.isInformational && secondary && !secondary.isInformational
@@ -104,6 +106,8 @@ function snapshot(
       : primary;
 
   return {
+    primaryLabel: id === "claude" ? "Session (5h)" : "Session",
+    secondaryLabel: "Weekly",
     providerId: id,
     displayName: display,
     primary,
@@ -220,6 +224,8 @@ describe("FloatBar", () => {
         ResetsInHoursMinutes: "Resets in {}h {}m",
         ResetsInDaysHours: "Resets in {}d {}h",
         TrayResetsDueNow: "Resetting",
+        ProviderSessionLabel: "Session",
+        ProviderWeeklyLabel: "Weekly",
         PanelToday: "Today",
         ActionRefreshAll: "Refresh all",
         SummaryRefreshing: "Refreshing",
@@ -257,8 +263,8 @@ describe("FloatBar", () => {
       (el) => el.getAttribute("title") ?? "",
     );
     // Highest used (codex, 75%) shows first; display follows showAsUsed.
-    expect(titles[0]).toMatch(/Codex: 5h 75% used/);
-    expect(titles[1]).toMatch(/Claude: 5h 20% used/);
+    expect(titles[0]).toMatch(/Codex: Session 75% used/);
+    expect(titles[1]).toMatch(/Claude: Session 20% used/);
   });
 
   it("renders session even when a weekly window is available", async () => {
@@ -274,7 +280,7 @@ describe("FloatBar", () => {
     );
     await waitFor(() => {
       expect(container.querySelector(".floatbar__quota")?.getAttribute("title")).toContain(
-        "Claude: 5h 20% used",
+        "Claude: Session 20% used",
       );
     });
   });
@@ -369,6 +375,15 @@ describe("FloatBar", () => {
     expect(tauriMocks.getProviderChartData).not.toHaveBeenCalled();
   });
 
+  it("does not claim no providers while a real local cost is renderable", async () => {
+    tauriMocks.getCachedProviders.mockResolvedValue([snapshot("codex", "Codex", 0, { informational: true })]);
+    tauriMocks.getProviderLocalUsageSummary.mockResolvedValue({ todayCost: 1.25, thirtyDayCost: 12.5 });
+    const { container } = renderFloatBar(bootstrap({ floatBarShowCost: true }));
+    await waitFor(() => expect(container.querySelectorAll(".floatbar__cost-pill")).toHaveLength(1));
+    expect(container.querySelectorAll(".floatbar__quota")).toHaveLength(0);
+    expect(screen.queryByText("No providers")).not.toBeInTheDocument();
+  });
+
   it("does not scan local costs by default", async () => {
     tauriMocks.getCachedProviders.mockResolvedValue([
       snapshot("codex", "Codex", 75),
@@ -395,7 +410,7 @@ describe("FloatBar", () => {
       const title = container
         .querySelector(".floatbar__quota")
         ?.getAttribute("title");
-      expect(title).toContain("Claude: 5h 80% remaining");
+      expect(title).toContain("Claude: Session 80% remaining");
     });
   });
 
@@ -553,7 +568,7 @@ describe("FloatBar", () => {
       const title = container
         .querySelector(".floatbar__quota")
         ?.getAttribute("title");
-      expect(title).toContain("Claude: 5h 20% used");
+      expect(title).toContain("Claude: Session 20% used");
       expect(title).toMatch(/Resets in 3h 4[12]m/);
       expect(title).not.toContain("Resets in due now");
     });
@@ -618,7 +633,7 @@ describe("FloatBar", () => {
     const codex = Array.from(container.querySelectorAll(".floatbar__pill")).find((row) => row.textContent?.includes("Codex"))!;
     const quotas = codex.querySelectorAll(".floatbar__quota");
     expect(quotas).toHaveLength(2);
-    expect(quotas[0].textContent).toBe(`5h${showAsUsed ? 96 : 4}%`);
+    expect(quotas[0].textContent).toBe(`Session${showAsUsed ? 96 : 4}%`);
     expect(quotas[1].textContent).toBe(`Weekly${showAsUsed ? 24 : 76}%`);
     expect(quotas[0]).toHaveClass("floatbar__quota--crit");
     expect(quotas[1]).toHaveClass("floatbar__quota--ok");
@@ -633,7 +648,7 @@ describe("FloatBar", () => {
         secondary: { used: 24, resetsAt: weeklyReset, resetDescription: "Wrong description" },
       }),
     ]);
-    const view = renderFloatBar(bootstrap({ floatBarShowResetInline: true, resetTimeRelative: false }));
+    const view = renderFloatBar(bootstrap({ floatBarShowResetInline: true, resetTimeRelative: true }));
     await waitFor(() => expect(view.container.querySelectorAll(".floatbar__reset")).toHaveLength(2));
     const resets = view.container.querySelectorAll(".floatbar__reset");
     expect(resets[0].textContent).toBe("4h57m");
@@ -644,20 +659,87 @@ describe("FloatBar", () => {
     expect(view.container.querySelectorAll(".floatbar__pct")[1].textContent).toBe("24%");
   });
 
-  it("does not fabricate weekly data or relabel Tokens/MCP windows", async () => {
-    const unrelated = snapshot("codex", "Codex", 20, { secondary: { used: 30 } });
-    unrelated.primaryLabel = "Tokens";
-    unrelated.secondaryLabel = "MCP";
-    tauriMocks.getCachedProviders.mockResolvedValue([
-      unrelated,
-      snapshot("claude", "Claude", 25),
-      snapshot("zai", "Z.ai", 40, { secondary: { used: 60 } }),
-    ]);
-    const { container } = renderFloatBar(bootstrap({ enabledProviders: ["codex", "claude", "zai"] }));
+  it("uses semantic durations even when supporting labels differ", async () => {
+    const actual = snapshot("claude", "Claude", 20, { secondary: { used: 30 } });
+    actual.primaryLabel = "Tokens";
+    actual.secondaryLabel = "MCP";
+    tauriMocks.getCachedProviders.mockResolvedValue([actual]);
+    const { container } = renderFloatBar(bootstrap());
+    await waitFor(() => expect(container.querySelectorAll(".floatbar__quota")).toHaveLength(2));
+    expect(container.querySelectorAll(".floatbar__quota")[0].textContent).toBe("Session20%");
+    expect(container.querySelectorAll(".floatbar__quota")[1].textContent).toBe("Weekly30%");
+  });
+
+  it("renders production Claude session and weekly labels", async () => {
+    const claude = snapshot("claude", "Claude", 25, { secondary: { used: 40 } });
+    expect(claude.primaryLabel).toBe("Session (5h)");
+    expect(claude.secondaryLabel).toBe("Weekly");
+    tauriMocks.getCachedProviders.mockResolvedValue([claude]);
+    const { container } = renderFloatBar(bootstrap());
+    await waitFor(() => expect(container.querySelectorAll(".floatbar__quota")).toHaveLength(2));
+    expect(container.querySelectorAll(".floatbar__quota")[0].textContent).toBe("Session25%");
+    expect(container.querySelectorAll(".floatbar__quota")[1].textContent).toBe("Weekly40%");
+  });
+
+  it("does not fabricate a missing weekly lane", async () => {
+    tauriMocks.getCachedProviders.mockResolvedValue([snapshot("claude", "Claude", 25)]);
+    const { container } = renderFloatBar(bootstrap());
     await waitFor(() => expect(container.querySelectorAll(".floatbar__pill")).toHaveLength(1));
-    expect(container.querySelector(".floatbar__identity")?.textContent?.trim()).toBe("Claude");
     expect(container.querySelectorAll(".floatbar__quota")).toHaveLength(1);
     expect(screen.queryByText("Weekly")).not.toBeInTheDocument();
+  });
+
+  it.each([false, true])("keeps Claude errors visible with unavailable quota (placeholder=%s)", async (placeholder) => {
+    const claude = snapshot("claude", "Claude", 0, { error: "Unavailable", informational: placeholder,
+      secondary: placeholder ? undefined : { used: 0 } });
+    if (placeholder) claude.primary.windowMinutes = null;
+    tauriMocks.getCachedProviders.mockResolvedValue([claude]);
+    const { container } = renderFloatBar(bootstrap());
+    await waitFor(() => expect(container.querySelectorAll(".floatbar__pill")).toHaveLength(1));
+    expect(screen.getByText("Claude")).toBeVisible();
+    expect(container.querySelectorAll(".floatbar__pct")).toHaveLength(placeholder ? 1 : 2);
+    for (const value of container.querySelectorAll(".floatbar__pct")) expect(value.textContent).toBe("—");
+    if (placeholder) expect(screen.queryByText("Weekly")).not.toBeInTheDocument();
+  });
+
+  it.each(["gemini", "copilot", "cursor", "zai"])("keeps %s selected-metric fallback without fake quota labels", async (id) => {
+    const provider = snapshot(id, id, 20, { selected: { used: 64, resetDescription: "Resets tomorrow" } });
+    provider.primaryLabel = "Tokens";
+    tauriMocks.getCachedProviders.mockResolvedValue([provider]);
+    const { container } = renderFloatBar(bootstrap({ enabledProviders: [id] }));
+    await waitFor(() => expect(container.querySelectorAll(".floatbar__pill")).toHaveLength(1));
+    expect(container.querySelector(".floatbar__pct")?.textContent).toBe("64%");
+    expect(container.querySelector(".floatbar__pill")).toHaveAttribute("title", `${id}: 64% used\nResets tomorrow`);
+    expect(screen.queryByText("Weekly")).not.toBeInTheDocument();
+    expect(screen.queryByText("Session")).not.toBeInTheDocument();
+    expect(screen.queryByText("No providers")).not.toBeInTheDocument();
+  });
+
+  it("keeps reset tooltip on the hit-testable pill with inline reset disabled", async () => {
+    tauriMocks.getCachedProviders.mockResolvedValue([snapshot("claude", "Claude", 25, {
+      resetDescription: "Resets in 2h", secondary: { used: 40, resetDescription: "Resets in 6d" },
+    })]);
+    const { container } = renderFloatBar(bootstrap({ floatBarShowResetInline: false }));
+    await waitFor(() => expect(container.querySelectorAll(".floatbar__pill")).toHaveLength(1));
+    expect(container.querySelector(".floatbar__pill")).toHaveAttribute("title", "Claude: Session 25% used\nResets in 2h / Weekly 40% used\nResets in 6d");
+    expect(container.querySelectorAll(".floatbar__reset")).toHaveLength(0);
+    expect(container.querySelector(".floatbar__pill")).toHaveAttribute("data-tauri-drag-region");
+  });
+
+  it("honors absolute reset formatting", async () => {
+    const reset = new Date(Date.now() + 24 * 60 * 60_000).toISOString();
+    tauriMocks.getCachedProviders.mockResolvedValue([snapshot("claude", "Claude", 25, { resetsAt: reset })]);
+    const { container } = renderFloatBar(bootstrap({ resetTimeRelative: false, floatBarShowResetInline: true }));
+    const expected = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }).format(new Date(reset));
+    await waitFor(() => expect(container.querySelector(".floatbar__reset-time")?.textContent).toBe(expected));
+    expect(container.querySelector(".floatbar__pill")?.getAttribute("title")).toContain(expected);
+  });
+
+  it("hides Refresh All in click-through mode", async () => {
+    tauriMocks.getCachedProviders.mockResolvedValue([snapshot("codex", "Codex", 20)]);
+    const { container } = renderFloatBar(bootstrap({ floatBarClickThrough: true }));
+    await waitFor(() => expect(container.querySelectorAll(".floatbar__pill")).toHaveLength(1));
+    expect(screen.queryByRole("button", { name: "Refresh all" })).not.toBeInTheDocument();
   });
 
   it("rejects unrelated window durations even for an agent provider", async () => {
@@ -696,6 +778,8 @@ describe("FloatBar", () => {
     tauriMocks.getCachedProviders.mockResolvedValue([]);
     renderFloatBar(bootstrap());
     const button = await screen.findByRole("button", { name: "Refresh all" });
+    expect(eventMocks.listeners.get("refresh-started")).toHaveLength(1);
+    expect(eventMocks.listeners.get("refresh-complete")).toHaveLength(1);
     const emit = (name: string, payload: unknown = {}) => {
       for (const listener of eventMocks.listeners.get(name) ?? []) listener({ payload });
     };

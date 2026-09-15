@@ -757,3 +757,7 @@ ProviderAccentColor = 强调色
 ProviderAccentColorHelper = 覆盖用于用量条和图表的品牌颜色。输入十六进制颜色，如 #FF5733。
 ProviderAccentColorReset = 恢复默认
 ProviderAccentColorInvalid = 无效的十六进制颜色。请使用 #RRGGBB 格式，例如 #FF5733。
+
+TrayFooterHide = 隐藏 { "{}" }
+TrayFooterShow = 显示 { "{}" }
+TrayFooterEditVisibility = 编辑页脚可见性

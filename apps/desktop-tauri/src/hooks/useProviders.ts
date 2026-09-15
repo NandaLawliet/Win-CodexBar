@@ -67,6 +67,8 @@ export function useProviders(options: UseProvidersOptions = {}): UseProvidersRes
   );
   const [hasLoadedCache, setHasLoadedCache] = useState(false);
   const refreshingRef = useRef(false);
+  const manualRefreshRef = useRef(false);
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const pendingSnapshotsRef = useRef<Map<string, ProviderUsageSnapshot>>(new Map());
   const flushTimerRef = useRef<number | undefined>(undefined);
   const resetRefreshTimerRef = useRef<number | undefined>(undefined);
@@ -110,8 +112,14 @@ export function useProviders(options: UseProvidersOptions = {}): UseProvidersRes
   const refresh = useCallback(() => {
     if (refreshingRef.current) return;
     refreshingRef.current = true;
+    manualRefreshRef.current = true;
+    setIsRefreshing(true);
     refreshProviders().catch(() => {
+      // A failed command may never emit refresh-complete.
+    }).finally(() => {
+      manualRefreshRef.current = false;
       refreshingRef.current = false;
+      setIsRefreshing(false);
       setRefreshingProviderIds(new Set());
     });
   }, []);
@@ -178,6 +186,7 @@ export function useProviders(options: UseProvidersOptions = {}): UseProvidersRes
     const unlistenStarted = listen<RefreshStartedPayload>("refresh-started", (event) => {
       if (!cancelled) {
         refreshingRef.current = true;
+        setIsRefreshing(true);
         setRefreshingProviderIds(new Set(event.payload.providerIds));
       }
     });
@@ -187,7 +196,8 @@ export function useProviders(options: UseProvidersOptions = {}): UseProvidersRes
       (event) => {
         if (!cancelled) {
           if (!settingsReloadingRef.current) flushPendingSnapshots();
-          refreshingRef.current = false;
+          refreshingRef.current = manualRefreshRef.current;
+          setIsRefreshing(manualRefreshRef.current);
           setRefreshingProviderIds(new Set());
           setLastRefresh(event.payload);
         }
@@ -203,6 +213,7 @@ export function useProviders(options: UseProvidersOptions = {}): UseProvidersRes
       refreshPromise.catch(() => {
         if (!cancelled) {
           refreshingRef.current = false;
+          setIsRefreshing(false);
           setRefreshingProviderIds(new Set());
         }
       });
@@ -292,7 +303,7 @@ export function useProviders(options: UseProvidersOptions = {}): UseProvidersRes
 
   return {
     providers,
-    isRefreshing: refreshingProviderIds.size > 0,
+    isRefreshing,
     refreshingProviderIds,
     refresh,
     lastRefresh,

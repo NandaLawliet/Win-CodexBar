@@ -679,3 +679,7 @@ ProviderAccentColor = 강조 색상
 ProviderAccentColorHelper = 사용량 막대와 차트에 사용되는 브랜드 색상을 재정의합니다. #FF5733 같은 16진수 색상을 입력하세요.
 ProviderAccentColorReset = 기본값으로 재설정
 ProviderAccentColorInvalid = 잘못된 16진수 색상입니다. #RRGGBB 형식(예: #FF5733)을 사용하세요.
+
+TrayFooterHide = { "{}" } 숨기기
+TrayFooterShow = { "{}" } 표시
+TrayFooterEditVisibility = 바닥글 표시 편집

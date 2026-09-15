@@ -758,3 +758,7 @@ ProviderAccentColor = アクセントカラー
 ProviderAccentColorHelper = 使用量バーとチャートのブランドカラーを上書きします。#FF5733 のような 16 進数カラーを入力。
 ProviderAccentColorReset = デフォルトにリセット
 ProviderAccentColorInvalid = 無効な 16 進数カラー。#RRGGBB 形式（例: #FF5733）を使用してください。
+
+TrayFooterHide = { "{}" }を非表示
+TrayFooterShow = { "{}" }を表示
+TrayFooterEditVisibility = フッターの表示を編集

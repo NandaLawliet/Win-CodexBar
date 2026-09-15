@@ -692,3 +692,7 @@ ProviderAccentColor = Color de acento
 ProviderAccentColorHelper = Anula el color de marca usado en barras de uso y gráficos. Introduce un color hexadecimal como #FF5733.
 ProviderAccentColorReset = Restablecer predeterminado
 ProviderAccentColorInvalid = Color hexadecimal no válido. Usa el formato #RRGGBB, por ejemplo #FF5733.
+
+TrayFooterHide = Ocultar { "{}" }
+TrayFooterShow = Mostrar { "{}" }
+TrayFooterEditVisibility = Editar visibilidad del pie

@@ -330,11 +330,9 @@ pub struct Settings {
     #[serde(default = "default_alibaba_token_plan_region")]
     pub alibaba_token_plan_region: String,
 
-    /// Opt-in: allow Codex usage reads from external (non-CLI-owned) OAuth
-    /// credential sources. Default OFF — when disabled, stale external OAuth
-    /// credential files fail closed instead of being used silently (upstream
-    /// 0.50.1 #2944). The CLI-owned `auth.json` is always read read-only; this
-    /// gate only controls whether stale external OAuth tokens are trusted.
+    /// Deprecated compatibility field, retained for existing settings files.
+    /// Ignored: Codex OAuth validity is decided by the authoritative backend,
+    /// never by credential-file age. `auth.json` remains read-only.
     #[serde(default)]
     pub codex_external_oauth_sources_allowed: bool,
 

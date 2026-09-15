@@ -760,3 +760,7 @@ DeepSeekPricingCurrent = Geçerli yerel saat:
 DeepSeekPricingNext = Sonraki geçiş:
 DeepSeekPricingEffective = Geçerli olduğu yerel saat:
 DeepSeekPricingAdvice = Resmî tarife: yoğun saatler UTC 01:00-04:00 ve 06:00-10:00; yoğun olmayan saatlerde yarı fiyat.
+
+TrayFooterHide = { "{}" } gizle
+TrayFooterShow = { "{}" } göster
+TrayFooterEditVisibility = Alt bilgi görünürlüğünü düzenle

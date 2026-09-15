@@ -1,24 +1,34 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useLocale } from "../hooks/useLocale";
 import type { MenuFooterRow } from "./MenuSurface";
 
 const STORAGE_KEY = "codexbar.trayFooterVisibility.v1";
 const DEFAULT_VISIBILITY = { zoom: true, settings: true, about: true, quit: true };
 type VisibilityKey = keyof typeof DEFAULT_VISIBILITY;
 
-function readVisibility(): typeof DEFAULT_VISIBILITY {
+function readVisibility() {
   const visibility = { ...DEFAULT_VISIBILITY };
+  let dirty = false;
   try {
-    const stored: unknown = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "null");
+    const raw = localStorage.getItem(STORAGE_KEY);
+    const stored: unknown = JSON.parse(raw ?? "null");
     if (stored && typeof stored === "object" && !Array.isArray(stored)) {
       for (const key of Object.keys(visibility) as VisibilityKey[]) {
         const value = (stored as Record<string, unknown>)[key];
         if (typeof value === "boolean") visibility[key] = value;
       }
     }
+    dirty = raw !== null && (
+      !stored || typeof stored !== "object" || Array.isArray(stored) ||
+      Object.entries(stored).some(([key, value]) =>
+        !Object.prototype.hasOwnProperty.call(DEFAULT_VISIBILITY, key) || typeof value !== "boolean",
+      )
+    );
   } catch {
     // Storage may be unavailable in a webview; the footer must remain usable.
+    dirty = true;
   }
-  return visibility;
+  return { visibility, dirty };
 }
 
 function EyeIcon({ open }: { open: boolean }) {
@@ -42,13 +52,20 @@ export default function TrayFooter({
   rows: MenuFooterRow[];
   onLayoutChange: () => void;
 }) {
-  const [visibility, setVisibility] = useState(readVisibility);
+  const { t } = useLocale();
+  const [initial] = useState(readVisibility);
+  const [visibility, setVisibility] = useState(initial.visibility);
+  const lastPersisted = useRef(initial.dirty ? null : JSON.stringify(initial.visibility));
   const [editing, setEditing] = useState(false);
   useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(visibility));
-    } catch {
-      // A blocked write must not prevent hiding or recovering controls.
+    const serialized = JSON.stringify(visibility);
+    if (lastPersisted.current !== serialized) {
+      lastPersisted.current = serialized;
+      try {
+        localStorage.setItem(STORAGE_KEY, serialized);
+      } catch {
+        // A blocked write must not prevent hiding or recovering controls.
+      }
     }
     onLayoutChange();
   }, [visibility, editing, onLayoutChange]);
@@ -57,8 +74,8 @@ export default function TrayFooter({
     <button
       type="button"
       className="tray-footer__eye"
-      aria-label={`${visibility[key] ? "Hide" : "Show"} ${label}`}
-      title={`${visibility[key] ? "Hide" : "Show"} ${label}`}
+      aria-label={t(visibility[key] ? "TrayFooterHide" : "TrayFooterShow").replace("{}", label)}
+      title={t(visibility[key] ? "TrayFooterHide" : "TrayFooterShow").replace("{}", label)}
       aria-pressed={visibility[key]}
       onClick={() => setVisibility((current) => ({ ...current, [key]: !current[key] }))}
     >
@@ -71,8 +88,8 @@ export default function TrayFooter({
       <button
         type="button"
         className="tray-footer__eye tray-footer__editor"
-        aria-label="Edit footer visibility"
-        title="Edit footer visibility"
+        aria-label={t("TrayFooterEditVisibility")}
+        title={t("TrayFooterEditVisibility")}
         aria-pressed={editing}
         onClick={() => setEditing((current) => !current)}
       >

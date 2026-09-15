@@ -273,17 +273,24 @@ describe("useProviders", () => {
   });
 
   it("manual refresh uses forced refresh", async () => {
+    let complete!: () => void;
+    tauriMocks.refreshProviders.mockImplementation(() => new Promise<void>((resolve) => { complete = resolve; }));
     const { result } = renderHook(() => useProviders());
-
-    await waitFor(() => {
-      expect(tauriMocks.refreshProvidersIfStale).toHaveBeenCalledTimes(1);
-    });
-
+    await waitFor(() => expect(result.current.hasLoadedCache).toBe(true));
+    expect(tauriMocks.refreshProvidersIfStale).toHaveBeenCalledTimes(1);
     act(() => {
       result.current.refresh();
+      result.current.refresh();
     });
-
     expect(tauriMocks.refreshProviders).toHaveBeenCalledTimes(1);
+    expect(result.current.isRefreshing).toBe(true);
+    act(() => emitProviderEvent("refresh-complete", { providerCount: 1, errorCount: 0 }));
+    // An early event cannot release the pending manual-command guard.
+    act(() => result.current.refresh());
+    expect(tauriMocks.refreshProviders).toHaveBeenCalledTimes(1);
+    expect(result.current.isRefreshing).toBe(true);
+    await act(async () => complete());
+    expect(result.current.isRefreshing).toBe(false);
   });
 
   it("reports cached data when cached providers are loaded", async () => {
@@ -416,6 +423,9 @@ describe("useProviders", () => {
 
     act(() => emitProviderEvent("provider-updated", provider("codex", 10)));
     expect([...result.current.refreshingProviderIds]).toEqual(["claude"]);
+    expect(result.current.isRefreshing).toBe(true);
+    act(() => emitProviderEvent("provider-updated", provider("claude", 20)));
+    expect(result.current.refreshingProviderIds.size).toBe(0);
     expect(result.current.isRefreshing).toBe(true);
 
     act(() =>

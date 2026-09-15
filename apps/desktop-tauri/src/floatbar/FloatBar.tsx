@@ -15,7 +15,6 @@ import { useProviders } from "../hooks/useProviders";
 import {
   getProviderLocalUsageSummary,
   getSettingsSnapshot,
-  refreshProviders,
   refreshProvidersIfStale,
 } from "../lib/tauri";
 import { ProviderIcon } from "../components/providers/ProviderIcon";
@@ -157,14 +156,12 @@ function CostPill({
 function quotaWindows(provider: ProviderUsageSnapshot) {
   if (provider.providerId !== "codex" && provider.providerId !== "claude") return null;
   const session = !provider.primary.isInformational &&
-    (provider.primary.windowMinutes == null || provider.primary.windowMinutes === 300) &&
-    (!provider.primaryLabel || /^(session|5h|5[- ]hour)$/i.test(provider.primaryLabel))
+    provider.primary.windowMinutes === 300
     ? provider.primary : null;
   const weekly = provider.secondary && !provider.secondary.isInformational &&
-    (provider.secondary.windowMinutes == null || provider.secondary.windowMinutes === 10_080) &&
-    (!provider.secondaryLabel || /^weekly$/i.test(provider.secondaryLabel))
+    provider.secondary.windowMinutes === 10_080
     ? provider.secondary : null;
-  return session || weekly ? { session, weekly } : null;
+  return session || weekly || provider.error ? { session, weekly } : null;
 }
 
 type QuotaPresentationProps = {
@@ -174,6 +171,7 @@ type QuotaPresentationProps = {
   showAsUsed: boolean;
   scale: number;
   showResetInline: boolean;
+  resetRelative: boolean;
   usedSuffix: string;
   remainingSuffix: string;
 };
@@ -189,16 +187,14 @@ function QuotaMetric({
   showResetInline,
   usedSuffix,
   remainingSuffix,
-}: QuotaPresentationProps & { rateWindow: RateWindowSnapshot; label: string }) {
-  const remaining = Math.max(0, Math.min(100, rateWindow.remainingPercent));
-  const used = Math.max(0, Math.min(100, rateWindow.usedPercent));
+  resetText,
+}: QuotaPresentationProps & { rateWindow: RateWindowSnapshot | null; label: string; resetText: string | null }) {
+  const remaining = Math.max(0, Math.min(100, rateWindow?.remainingPercent ?? 0));
+  const used = Math.max(0, Math.min(100, rateWindow?.usedPercent ?? 0));
   const suffix = showAsUsed ? usedSuffix : remainingSuffix;
-  const value = provider.error ? "—" : `${Math.round(showAsUsed ? used : remaining)}%`;
-  const tone = provider.error || rateWindow.isExhausted || remaining <= critRemaining
+  const value = provider.error || !rateWindow ? "—" : `${Math.round(showAsUsed ? used : remaining)}%`;
+  const tone = provider.error || rateWindow?.isExhausted || remaining <= critRemaining
     ? "crit" : remaining <= highRemaining ? "warn" : "ok";
-  // This surface explicitly presents countdowns, independently of the tray's
-  // relative/absolute reset preference, using the shared localized formatter.
-  const resetText = useFormattedResetTime(rateWindow.resetsAt, rateWindow.resetDescription, true);
   const countdown = resetText ? inlineResetTime(resetText) : null;
   return (
     <div className={`floatbar__quota floatbar__quota--${tone}`} data-tauri-drag-region
@@ -221,20 +217,37 @@ function QuotaMetric({
 }
 
 function ProviderPill(props: QuotaPresentationProps) {
+  const { t } = useLocale();
   const { provider, scale } = props;
   const windows = quotaWindows(provider);
-  if (!windows) return null;
+  const agent = provider.providerId === "codex" || provider.providerId === "claude";
+  const first = agent ? windows?.session ?? null : provider.selectedMetric;
+  const second = windows?.weekly ?? null;
+  const firstReset = useFormattedResetTime(first?.resetsAt ?? null, first?.resetDescription ?? null, props.resetRelative);
+  const secondReset = useFormattedResetTime(second?.resetsAt ?? null, second?.resetDescription ?? null, props.resetRelative);
+  const firstLabel = agent ? t("ProviderSessionLabel") : "";
+  const secondLabel = t("ProviderWeeklyLabel");
+  const suffix = props.showAsUsed ? props.usedSuffix : props.remainingSuffix;
+  const describe = (window: RateWindowSnapshot | null, label: string, reset: string | null) => {
+    const percent = props.showAsUsed ? window?.usedPercent : window?.remainingPercent;
+    const value = provider.error || percent == null ? "—" : `${Math.round(Math.max(0, Math.min(100, percent)))}%`;
+    return `${label} ${value} ${suffix}${reset ? `\n${reset}` : ""}`.trim();
+  };
+  const title = `${provider.displayName}: ${[
+    first || provider.error ? describe(first, firstLabel, firstReset) : null,
+    second ? describe(second, secondLabel, secondReset) : null,
+  ].filter(Boolean).join(" / ")}`;
   const brand = getProviderIcon(provider.providerId).brandColor;
   return (
-    <div className="floatbar__pill" data-tauri-drag-region style={{ "--brand": brand } as CSSProperties}>
+    <div className="floatbar__pill" title={title} data-tauri-drag-region style={{ "--brand": brand } as CSSProperties}>
       <span className="floatbar__identity" data-tauri-drag-region>
         <span className="floatbar__provider-icon" data-tauri-drag-region>
           <ProviderIcon providerId={provider.providerId} size={Math.round(13 * scale)} />
         </span>
         <span data-tauri-drag-region>{provider.displayName}</span>
       </span>
-      {windows.session ? <QuotaMetric {...props} rateWindow={windows.session} label="5h" /> : <span />}
-      {windows.weekly ? <QuotaMetric {...props} rateWindow={windows.weekly} label="Weekly" /> : <span />}
+      {first || provider.error ? <QuotaMetric {...props} rateWindow={first} label={firstLabel} resetText={firstReset} /> : <span />}
+      {second ? <QuotaMetric {...props} rateWindow={second} label={secondLabel} resetText={secondReset} /> : <span />}
     </div>
   );
 }
@@ -248,44 +261,12 @@ function ProviderPill(props: QuotaPresentationProps) {
  */
 export default function FloatBar({ state }: { state: BootstrapState }) {
   const { t } = useLocale();
-  const { providers } = useProviders({
+  const { providers, isRefreshing, refresh: refreshAll } = useProviders({
     refreshOnMount: false,
   });
   const startDrag = useCallback((event: MouseEvent<HTMLElement>) => {
     if (event.button !== 0 || (event.target as HTMLElement).closest("button")) return;
     void getCurrentWindow().startDragging().catch(() => {});
-  }, []);
-
-  const manualRefreshRef = useRef(false);
-  const cycleActiveRef = useRef(false);
-  const [isRefreshing, setIsRefreshing] = useState(false);
-  useEffect(() => {
-    const started = listen("refresh-started", () => {
-      cycleActiveRef.current = true;
-      setIsRefreshing(true);
-    });
-    const complete = listen("refresh-complete", () => {
-      cycleActiveRef.current = false;
-      setIsRefreshing(manualRefreshRef.current);
-    });
-    return () => {
-      void started.then((fn) => fn());
-      void complete.then((fn) => fn());
-    };
-  }, []);
-  const refreshAll = useCallback(async () => {
-    if (manualRefreshRef.current || cycleActiveRef.current) return;
-    manualRefreshRef.current = true;
-    setIsRefreshing(true);
-    try {
-      await refreshProviders();
-    } catch {
-      // A failed command may never emit refresh-complete.
-      cycleActiveRef.current = false;
-    } finally {
-      manualRefreshRef.current = false;
-      setIsRefreshing(cycleActiveRef.current);
-    }
   }, []);
 
   // Mark the body so our CSS can strip the dark theme background — the
@@ -354,7 +335,11 @@ export default function FloatBar({ state }: { state: BootstrapState }) {
     );
   }, [providers, settings.enabledProviders, filterIds]);
 
-  const quotaProviders = visible.filter((provider) => quotaWindows(provider) !== null);
+  const renderableProviders = visible.filter((provider) =>
+    provider.providerId === "codex" || provider.providerId === "claude"
+      ? quotaWindows(provider) !== null
+      : Boolean(provider.error) || !provider.selectedMetric.isInformational,
+  );
 
   const visibleCostTargets = useMemo<FloatBarCostTarget[]>(
     () =>
@@ -500,14 +485,14 @@ export default function FloatBar({ state }: { state: BootstrapState }) {
       }
     >
       <div className="floatbar__handle" data-tauri-drag-region aria-hidden />
-      {quotaProviders.length === 0 ? (
+      {renderableProviders.length === 0 && visibleCosts.length === 0 ? (
         <div className="floatbar__empty" data-tauri-drag-region>
           {t("FloatBarNoProviders")}
         </div>
       ) : (
         <>
           <div className="floatbar__providers" data-tauri-drag-region>
-            {quotaProviders.map((p) => (
+            {renderableProviders.map((p) => (
               <ProviderPill
                 key={providerCostKey(p)}
                 provider={p}
@@ -516,6 +501,7 @@ export default function FloatBar({ state }: { state: BootstrapState }) {
                 showAsUsed={settings.showAsUsed}
                 scale={scale}
                 showResetInline={showResetInline}
+                resetRelative={settings.resetTimeRelative}
                 usedSuffix={t("PanelUsedSuffix")}
                 remainingSuffix={t("FloatBarRemainingSuffix")}
               />
@@ -532,14 +518,14 @@ export default function FloatBar({ state }: { state: BootstrapState }) {
           thirtyDayLabel={t("FloatBarThirtyDayShort")}
         />
       ))}
-      <button type="button" className="floatbar__refresh" disabled={isRefreshing}
+      {!settings.floatBarClickThrough && <button type="button" className="floatbar__refresh" disabled={isRefreshing}
         aria-label={t("ActionRefreshAll")} title={t("ActionRefreshAll")} aria-busy={isRefreshing}
         onPointerDown={(event) => event.stopPropagation()}
         onMouseDown={(event) => event.stopPropagation()}
         onClick={() => void refreshAll()}>
         <ResetIcon size={Math.round(12 * scale)} />
         <span>{isRefreshing ? t("SummaryRefreshing") : t("ActionRefreshAll")}</span>
-      </button>
+      </button>}
     </div>
   );
 }
