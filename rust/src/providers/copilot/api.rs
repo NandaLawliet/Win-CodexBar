@@ -453,19 +453,36 @@ impl UsableQuota {
     }
 
     fn to_rate_window(&self, reset: Option<DateTime<Utc>>) -> RateWindow {
-        let used_percent = (100.0 - self.percent_remaining).max(0.0);
+        // Authority is decided from the **raw** upstream percentage, before the
+        // subtraction and the `max(0.0)` floor below can turn nonsense into an
+        // in-range number. Deriving it from `used_percent` instead would launder
+        // invalid data into a healthy reading: `percent_remaining = 150` floors
+        // to 0% used, and `NaN`/`inf` reach the same 0% because `f64::max`
+        // discards a NaN operand — each producing an "authoritative" lane with
+        // 100% headroom out of a value the provider contract rejects.
+        let authoritative = RateWindow::percent_is_trustworthy(self.percent_remaining);
+
+        // Copilot reports overage as a negative `percent_remaining`, and the
+        // resulting above-100% literal is what the UI renders — so this lane
+        // keeps it instead of routing through the clamping constructors. Only
+        // finite input can be preserved that way: a non-finite percentage has
+        // no display meaning and would serialize to JSON `null`, breaking the
+        // `f64` schema, so it collapses to the same non-authoritative `0.0`
+        // placeholder the shared normalization uses.
+        let used_percent = if self.percent_remaining.is_finite() {
+            (100.0 - self.percent_remaining).max(0.0)
+        } else {
+            0.0
+        };
         let reset_description = (used_percent > 100.0).then(|| format!("{used_percent:.0}% used"));
-        // Copilot reports overage above 100%, and the raw value is what the UI
-        // renders — so this lane keeps the literal instead of routing through
-        // the clamping constructors. Quota authority still follows the shared
-        // rule: only an in-range percent may back a security decision.
+
         RateWindow {
             used_percent,
             window_minutes: None,
             resets_at: reset,
             reset_description,
             is_informational: false,
-            quota_authoritative: RateWindow::percent_is_trustworthy(used_percent),
+            quota_authoritative: authoritative,
         }
     }
 }
@@ -776,6 +793,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::guard::guard_remaining_headroom;
+    use crate::core::RateWindowCadence;
 
     fn parse_snapshot(json: &str) -> UsageSnapshot {
         let response: CopilotUsageResponse = serde_json::from_str(json).unwrap();
@@ -1020,6 +1039,115 @@ mod tests {
             usage.primary.reset_description.as_deref(),
             Some("115% used")
         );
+    }
+
+    // ── Raw-value quota authority (R1 corrective F2) ───────────────────────
+    //
+    // Authority must follow the raw `percent_remaining` the API reported, not
+    // the locally derived `used_percent`: the derivation floors at 0 and drops
+    // NaN, so an out-of-contract upstream value can otherwise arrive as a
+    // perfectly healthy 0%-used lane.
+
+    /// Primary lane parsed from a single premium quota with the given raw
+    /// `percent_remaining` JSON token (number or quoted string).
+    fn primary_for_percent_remaining(raw: &str) -> RateWindow {
+        parse_snapshot(&format!(
+            r#"{{
+                "copilot_plan": "pro",
+                "quota_snapshots": {{
+                    "premium_interactions": {{
+                        "percent_remaining": {raw},
+                        "quota_id": "premium_interactions"
+                    }}
+                }}
+            }}"#
+        ))
+        .primary
+    }
+
+    /// `used_percent` as it actually reaches the public usage JSON.
+    fn serialized_used_percent(window: &RateWindow) -> Option<f64> {
+        let json = serde_json::to_string(window).expect("serialize");
+        serde_json::from_str::<Value>(&json)
+            .expect("valid JSON")
+            .get("used_percent")
+            .and_then(Value::as_f64)
+    }
+
+    fn assert_quota_unavailable(raw: &str) {
+        let window = primary_for_percent_remaining(raw);
+
+        assert_eq!(
+            window.trusted_used_percent(),
+            None,
+            "raw percent_remaining {raw} must not back a quota decision"
+        );
+        assert!(!window.quota_authoritative);
+        assert_eq!(
+            guard_remaining_headroom(Some(&window), RateWindowCadence::Session),
+            None,
+            "guard must report unavailable rather than favorable headroom for {raw}"
+        );
+
+        let serialized = serialized_used_percent(&window)
+            .unwrap_or_else(|| panic!("used_percent for {raw} must stay a JSON number, not null"));
+        assert!(
+            serialized.is_finite(),
+            "used_percent for {raw} must be finite in JSON"
+        );
+    }
+
+    fn assert_quota_authoritative(raw: &str, expected_used: f64) {
+        let window = primary_for_percent_remaining(raw);
+
+        assert!((window.used_percent - expected_used).abs() < 0.001);
+        assert_eq!(window.trusted_used_percent(), Some(window.used_percent));
+        assert_eq!(
+            guard_remaining_headroom(Some(&window), RateWindowCadence::Session),
+            Some(100.0 - expected_used)
+        );
+        assert_eq!(serialized_used_percent(&window), Some(expected_used));
+    }
+
+    #[test]
+    fn valid_raw_percent_remaining_stays_authoritative() {
+        assert_quota_authoritative("40", 60.0);
+        assert_quota_authoritative("100", 0.0);
+        assert_quota_authoritative("0", 100.0);
+    }
+
+    #[test]
+    fn above_range_raw_percent_remaining_is_not_authoritative() {
+        // 150% remaining is outside the provider contract. The derived value
+        // floors to 0% used — which would read as a brand-new, fully available
+        // quota — so authority must come from the raw value instead.
+        let window = primary_for_percent_remaining("150");
+
+        assert_eq!(window.used_percent, 0.0, "display behavior is unchanged");
+        assert_quota_unavailable("150");
+    }
+
+    #[test]
+    fn overage_raw_percent_remaining_keeps_display_without_authority() {
+        let window = primary_for_percent_remaining("-15");
+
+        assert!((window.used_percent - 115.0).abs() < 0.001);
+        assert_eq!(window.reset_description.as_deref(), Some("115% used"));
+        assert_quota_unavailable("-15");
+    }
+
+    #[test]
+    fn non_finite_raw_percent_remaining_is_json_safe_and_unavailable() {
+        for raw in ["\"NaN\"", "\"inf\"", "\"-inf\""] {
+            let window = primary_for_percent_remaining(raw);
+
+            assert!(
+                window.used_percent.is_finite(),
+                "{raw} must never be retained in the rate window"
+            );
+            assert_eq!(window.used_percent, 0.0);
+            assert_quota_unavailable(raw);
+        }
     }
 
     #[test]

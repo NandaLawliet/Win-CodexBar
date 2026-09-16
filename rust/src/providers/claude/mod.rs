@@ -591,31 +591,18 @@ impl ClaudeProvider {
             ));
         }
 
-        // Parse session percent: "X% used" or "X% left"
-        let mut session_percent: Option<f64> = None;
-        let mut weekly_percent: Option<f64> = None;
+        // Lane attribution is evidence-based, never positional. Each lane is
+        // read from its own labeled section, so a weekly percentage can never
+        // be promoted into the session lane by being the first (or only)
+        // percentage the transcript happens to print.
+        let mut session_percent = extract_session_percent(&clean);
+        let weekly_percent = extract_percent_near_label(&clean, "current week (all models)")
+            .or_else(|| extract_percent_near_label(&clean, "current week"));
 
-        // Look for "Current session" section
-        if let Some(session_pct) = extract_percent_near_label(&clean, "current session") {
-            session_percent = Some(session_pct);
-        }
-
-        // Look for "Current week" section
-        if let Some(weekly_pct) = extract_percent_near_label(&clean, "current week (all models)")
-            .or_else(|| extract_percent_near_label(&clean, "current week"))
-        {
-            weekly_percent = Some(weekly_pct);
-        }
-
-        // Fallback: collect all percentages in order
-        if session_percent.is_none() {
-            let all_percents = extract_all_percents(&clean);
-            if !all_percents.is_empty() {
-                session_percent = Some(all_percents[0]);
-            }
-            if all_percents.len() > 1 && weekly_percent.is_none() {
-                weekly_percent = Some(all_percents[1]);
-            }
+        // Header-less fallback, admitted only when nothing else in the
+        // transcript could own the value (see `sole_unlabeled_session_percent`).
+        if session_percent.is_none() && weekly_percent.is_none() {
+            session_percent = sole_unlabeled_session_percent(&clean);
         }
 
         if session_percent.is_none()
@@ -917,6 +904,78 @@ fn extract_percent_near_label(text: &str, label: &str) -> Option<f64> {
     }
 
     None
+}
+
+/// Normalized marker of the CLI's 5-hour session section.
+const CLI_SESSION_LABEL: &str = "currentsession";
+
+/// Whether a line belongs to — or introduces — a lane other than the 5-hour
+/// session (weekly, scoped weekly, extra usage, monthly).
+fn claims_non_session_lane(line: &str) -> bool {
+    let normalized = normalized_for_label_search(line);
+    normalized.contains("week") || normalized.contains("extrausage") || normalized.contains("month")
+}
+
+/// Whether a line declares that there is no session to measure.
+fn reports_no_active_session(line: &str) -> bool {
+    let normalized = normalized_for_label_search(line);
+    normalized.contains("noactive") && normalized.contains("session")
+}
+
+/// Percentage evidence that provably belongs to the 5-hour session lane.
+///
+/// Only the `Current session` section can supply it, and the forward scan stops
+/// at the next section header, at any line that claims a different lane, and at
+/// an explicit "no active session" marker. Without those stops a transcript
+/// whose session section is empty — `Current session` / `No active session` —
+/// would hand the *weekly* percentage printed below it to the session lane,
+/// where it would become authoritative session quota.
+fn extract_session_percent(text: &str) -> Option<f64> {
+    let lines: Vec<&str> = text.lines().collect();
+
+    for (idx, line) in lines.iter().enumerate() {
+        if !normalized_for_label_search(line).contains(CLI_SESSION_LABEL) {
+            continue;
+        }
+
+        for (offset, next_line) in lines.iter().skip(idx).take(12).enumerate() {
+            if offset > 0 && starts_next_usage_section(next_line, CLI_SESSION_LABEL) {
+                break;
+            }
+            if claims_non_session_lane(next_line) || reports_no_active_session(next_line) {
+                break;
+            }
+            if let Some(pct) = parse_percent_line(next_line) {
+                return Some(pct);
+            }
+        }
+    }
+
+    None
+}
+
+/// Session evidence recovered from a header-less status line.
+///
+/// Older Claude status output prints a single session percentage with no
+/// section headers at all, and that one value is attributable by exclusion: the
+/// transcript carries no session, weekly, scoped-weekly, or extra-usage marker
+/// that could own it, and no second percentage competing for the lane. Anything
+/// richer is ambiguous — position in the text is not attribution — so it yields
+/// no session evidence rather than a guess that would read as authoritative
+/// quota.
+fn sole_unlabeled_session_percent(text: &str) -> Option<f64> {
+    let has_lane_marker = text.lines().any(|line| {
+        normalized_for_label_search(line).contains(CLI_SESSION_LABEL)
+            || claims_non_session_lane(line)
+    });
+    if has_lane_marker {
+        return None;
+    }
+
+    match extract_all_percents(text).as_slice() {
+        [only] => Some(*only),
+        _ => None,
+    }
 }
 
 /// Build the 5-hour session primary from an optionally-parsed CLI percentage.
@@ -1602,6 +1661,150 @@ Status   Config   Usage
             weekly.authoritative_used_percent(RateWindowCadence::Weekly),
             Some(4.0)
         );
+    }
+
+    // ── Lane attribution through the production parser (R1 corrective F1) ──
+    //
+    // These run `parse_cli_output` itself, not the `cli_session_primary` seam:
+    // the seam only reports the attribution it is handed, so it cannot prove
+    // that weekly evidence never reaches the session lane.
+
+    /// Session evidence for the security-sensitive 5-hour lane, or `None` when
+    /// the parsed snapshot cannot back a quota decision.
+    fn session_quota(result: &ProviderFetchResult) -> Option<f64> {
+        result
+            .usage
+            .primary
+            .authoritative_used_percent(RateWindowCadence::Session)
+    }
+
+    #[test]
+    fn weekly_percent_never_backfills_an_empty_session_section() {
+        let provider = ClaudeProvider::new();
+        let output = r#"
+Status   Config   Usage
+
+  Current session
+  No active session
+
+  Current week (all models)
+  20% used
+  Resets Apr 3, 2pm
+"#;
+
+        let result = provider.parse_cli_output(output).expect("should parse");
+
+        assert_eq!(
+            session_quota(&result),
+            None,
+            "weekly evidence must never become authoritative session evidence"
+        );
+        assert_eq!(result.usage.primary.trusted_used_percent(), None);
+        assert!(!result.usage.primary.quota_authoritative);
+        assert_eq!(
+            result
+                .usage
+                .secondary
+                .expect("weekly present")
+                .authoritative_used_percent(RateWindowCadence::Weekly),
+            Some(20.0),
+            "the weekly lane keeps its own valid evidence"
+        );
+    }
+
+    #[test]
+    fn weekly_only_transcript_leaves_the_session_lane_unavailable() {
+        let provider = ClaudeProvider::new();
+        let output = r#"
+Status   Config   Usage
+
+  Current week (all models)
+  20% used
+  Resets Apr 3, 2pm
+"#;
+
+        let result = provider.parse_cli_output(output).expect("should parse");
+
+        assert_eq!(session_quota(&result), None);
+        assert_eq!(result.usage.primary.used_percent, 0.0);
+        assert_eq!(
+            result
+                .usage
+                .secondary
+                .expect("weekly present")
+                .authoritative_used_percent(RateWindowCadence::Weekly),
+            Some(20.0)
+        );
+    }
+
+    #[test]
+    fn empty_session_section_ignores_an_unprefixed_weekly_header() {
+        // The section-boundary rule cannot rely on the next header starting
+        // with "Current": an empty session section followed by any other lane
+        // must still yield no session evidence.
+        let provider = ClaudeProvider::new();
+        let output = r#"
+  Current session
+  No active session
+
+  Weekly limit
+  20% used
+"#;
+
+        let session_is_authoritative = provider
+            .parse_cli_output(output)
+            .ok()
+            .and_then(|result| session_quota(&result))
+            .is_some();
+
+        assert!(
+            !session_is_authoritative,
+            "a weekly percentage must not become session quota"
+        );
+    }
+
+    #[test]
+    fn header_less_single_percent_stays_session_evidence() {
+        // The one retained unlabeled format: a status line with no session,
+        // weekly, scoped-weekly, or extra-usage marker anywhere, and exactly
+        // one percentage. Nothing else in the transcript can own that value,
+        // so attributing it to the session lane is provable rather than
+        // positional.
+        let provider = ClaudeProvider::new();
+
+        let result = provider
+            .parse_cli_output("17% used \u{00b7} Resets 8pm (America/Bogota)")
+            .expect("should parse");
+
+        assert_eq!(session_quota(&result), Some(17.0));
+        assert!(result.usage.secondary.is_none());
+    }
+
+    #[test]
+    fn header_less_multi_percent_transcript_is_not_attributed_by_order() {
+        let provider = ClaudeProvider::new();
+
+        let err = provider
+            .parse_cli_output("17% used\n4% used\n")
+            .expect_err("ambiguous lanes must not be guessed");
+
+        assert_eq!(
+            err.to_string(),
+            "Parse error: Claude CLI did not return usage data"
+        );
+    }
+
+    #[test]
+    fn extra_usage_percent_is_not_session_evidence() {
+        let provider = ClaudeProvider::new();
+
+        let session_is_authoritative = provider
+            .parse_cli_output("  Extra usage\n  4% used\n  $3.31 / $70.00 spent\n")
+            .ok()
+            .and_then(|result| session_quota(&result))
+            .is_some();
+
+        assert!(!session_is_authoritative);
     }
 
     #[test]
