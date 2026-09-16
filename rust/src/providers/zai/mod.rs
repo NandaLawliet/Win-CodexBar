@@ -355,7 +355,17 @@ impl ZaiProvider {
         // used signal (`usage - remaining`, or `currentValue`) wins over the
         // API's own `percentage`; otherwise `percentage` is trusted, and
         // legacy `limit`/`used` responses fall back to the old math.
-        fn compute_percent(l: &ZaiLimit) -> f64 {
+        //
+        // Returns `(used_percent, quota_authoritative)`. The percentage is
+        // returned **unclamped** so `RateWindow::with_details` owns the
+        // `[0, 100]` clamp: clamping here first would hand the constructor an
+        // already-in-range number and launder, say, a `-50` percentage into an
+        // authoritative "0% used / 100% remaining". The clamped values are
+        // identical either way; only the authority differs.
+        //
+        // The flag is `false` for the no-limit fallback, which invents a
+        // 0%/100% verdict with no quota denominator behind it.
+        fn compute_percent(l: &ZaiLimit) -> (f64, bool) {
             if let Some(usage) = l.usage.filter(|&usage| usage > 0.0) {
                 let used = if let Some(remaining) = l.remaining {
                     let from_remaining = usage - remaining;
@@ -364,20 +374,25 @@ impl ZaiProvider {
                 } else {
                     l.current_value.unwrap_or(0.0)
                 };
+                // `used` is clamped to the reported total, so the ratio is a
+                // genuine in-range percentage.
                 let clamped = used.clamp(0.0, usage);
-                return (clamped / usage * 100.0).clamp(0.0, 100.0);
+                return (clamped / usage * 100.0, true);
             }
             if let Some(percentage) = l.percentage {
-                return percentage.clamp(0.0, 100.0);
+                return (percentage, true);
             }
 
             let limit = l.limit.unwrap_or(0.0);
             if limit <= 0.0 {
-                return if l.used.unwrap_or(0.0) > 0.0 || l.current_value.unwrap_or(0.0) > 0.0 {
-                    100.0
-                } else {
-                    0.0
-                };
+                // No limit configured: this is a presence heuristic, not a quota.
+                let fallback =
+                    if l.used.unwrap_or(0.0) > 0.0 || l.current_value.unwrap_or(0.0) > 0.0 {
+                        100.0
+                    } else {
+                        0.0
+                    };
+                return (fallback, false);
             }
             let used = {
                 let from_remaining = l.remaining.map(|r| limit - r);
@@ -387,7 +402,7 @@ impl ZaiProvider {
                 let candidates = [from_remaining, from_current, from_used];
                 candidates.iter().filter_map(|&v| v).fold(0.0_f64, f64::max)
             };
-            ((used / limit) * 100.0).clamp(0.0, 100.0)
+            ((used / limit) * 100.0, true)
         }
 
         // Upstream 0.48.0 `rateWindow`/`resetDescription`: only token-type
@@ -413,12 +428,14 @@ impl ZaiProvider {
             } else {
                 None
             };
+            let (used_percent, authoritative) = compute_percent(l);
             RateWindow::with_details(
-                compute_percent(l),
+                used_percent,
                 window_mins,
                 resets_at,
                 rate_window_reset_description(l, window_mins),
             )
+            .with_quota_authority(authoritative)
         }
 
         // Upstream 0.48.0 bucket split: with 2+ token limits, the shortest
@@ -437,9 +454,11 @@ impl ZaiProvider {
             None
         };
 
+        // No token limit and no MCP limit at all: the 0.0 is a shape
+        // placeholder, so it must not read as a healthy quota.
         let primary = primary_limit
             .map(make_window)
-            .unwrap_or_else(|| RateWindow::new(0.0));
+            .unwrap_or_else(|| RateWindow::new(0.0).non_authoritative());
         let mut usage = UsageSnapshot::new(primary).with_login_method(plan_name);
         if let Some(secondary) = secondary_limit {
             usage = usage.with_secondary(make_window(secondary));
@@ -965,6 +984,125 @@ mod tests {
         .unwrap();
         let usage = provider.parse_quota_response(&quota).unwrap();
         assert_eq!(usage.login_method.as_deref(), Some("z.ai"));
+    }
+
+    // ── Quota-authority regressions ───────────────────────────────────────
+
+    #[test]
+    fn no_limits_at_all_is_not_an_authoritative_healthy_quota() {
+        let provider = ZaiProvider::new();
+        let quota: ZaiQuotaResponse = serde_json::from_value(serde_json::json!({
+            "code": 200,
+            "data": { "planName": "z.ai", "limits": [] }
+        }))
+        .unwrap();
+
+        let usage = provider.parse_quota_response(&quota).unwrap();
+
+        assert_eq!(usage.primary.used_percent, 0.0, "display value unchanged");
+        assert!(!usage.primary.quota_authoritative);
+        assert_eq!(usage.primary.trusted_used_percent(), None);
+    }
+
+    #[test]
+    fn zero_limit_fallback_is_not_an_authoritative_quota() {
+        // `limit <= 0` means no quota was configured; the 0%/100% verdict is a
+        // presence heuristic with no denominator behind it.
+        let provider = ZaiProvider::new();
+        let quota: ZaiQuotaResponse = serde_json::from_value(serde_json::json!({
+            "code": 200,
+            "data": {
+                "limits": [{
+                    "type": "TOKENS_LIMIT",
+                    "used": 0,
+                    "limit": 0,
+                    "unit": 3,
+                    "number": 5
+                }]
+            }
+        }))
+        .unwrap();
+
+        let usage = provider.parse_quota_response(&quota).unwrap();
+
+        assert_eq!(usage.primary.used_percent, 0.0);
+        assert!(!usage.primary.quota_authoritative);
+        assert_eq!(usage.primary.trusted_used_percent(), None);
+    }
+
+    #[test]
+    fn negative_percentage_cannot_launder_into_full_remaining_quota() {
+        // serde_json rejects non-finite JSON literals outright, so the
+        // reachable invalid shape here is an out-of-range percentage. Clamping
+        // it to 0 must not also hand it quota authority.
+        let provider = ZaiProvider::new();
+        let quota: ZaiQuotaResponse = serde_json::from_value(serde_json::json!({
+            "code": 200,
+            "data": {
+                "limits": [{
+                    "type": "TOKENS_LIMIT",
+                    "unit": 3,
+                    "number": 5,
+                    "percentage": -50
+                }]
+            }
+        }))
+        .unwrap();
+
+        let usage = provider.parse_quota_response(&quota).unwrap();
+
+        assert_eq!(usage.primary.used_percent, 0.0, "clamp behavior unchanged");
+        assert!(!usage.primary.quota_authoritative);
+        assert_eq!(usage.primary.trusted_used_percent(), None);
+    }
+
+    #[test]
+    fn over_hundred_percentage_is_clamped_but_unauthoritative() {
+        let provider = ZaiProvider::new();
+        let quota: ZaiQuotaResponse = serde_json::from_value(serde_json::json!({
+            "code": 200,
+            "data": {
+                "limits": [{
+                    "type": "TOKENS_LIMIT",
+                    "unit": 3,
+                    "number": 5,
+                    "percentage": 150
+                }]
+            }
+        }))
+        .unwrap();
+
+        let usage = provider.parse_quota_response(&quota).unwrap();
+
+        assert_eq!(
+            usage.primary.used_percent, 100.0,
+            "clamp behavior unchanged"
+        );
+        assert!(!usage.primary.quota_authoritative);
+    }
+
+    #[test]
+    fn real_limits_stay_authoritative() {
+        let provider = ZaiProvider::new();
+        let quota: ZaiQuotaResponse = serde_json::from_value(serde_json::json!({
+            "code": 200,
+            "data": {
+                "limits": [{
+                    "type": "TOKENS_LIMIT",
+                    "used": 10,
+                    "limit": 100,
+                    "unit": 3,
+                    "number": 5
+                }]
+            }
+        }))
+        .unwrap();
+
+        let usage = provider.parse_quota_response(&quota).unwrap();
+
+        assert_eq!(usage.primary.used_percent, 10.0);
+        assert!(usage.primary.quota_authoritative);
+        assert_eq!(usage.primary.trusted_used_percent(), Some(10.0));
     }
 
     #[test]

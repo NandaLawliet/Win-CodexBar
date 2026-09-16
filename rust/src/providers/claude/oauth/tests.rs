@@ -459,3 +459,83 @@ fn backoff_kinds_have_distinct_user_messages() {
     assert!(cooldown.contains("retry shortly"), "{cooldown}");
     assert!(cooldown.contains("claude login"), "{cooldown}");
 }
+
+// ── Quota-authority regressions ─────────────────────────────────────────────
+
+#[test]
+fn absent_primary_is_not_an_authoritative_healthy_session() {
+    use crate::core::RateWindowCadence;
+
+    // No limits[] session entry and no legacy five_hour: the 0.0 primary is a
+    // shape placeholder, not a reading of a fully-available session.
+    let response: OAuthUsageResponse = serde_json::from_str(
+        r#"{
+            "seven_day": {"utilization": 26.0}
+        }"#,
+    )
+    .expect("weekly-only body");
+
+    let credentials = ClaudeOAuthCredentials {
+        access_token: "token".to_string(),
+        refresh_token: None,
+        expires_at: None,
+        scopes: vec![],
+        rate_limit_tier: None,
+    };
+    let usage = ClaudeOAuthFetcher::new().build_usage_snapshot(&response, &credentials);
+
+    assert_eq!(usage.primary.used_percent, 0.0, "display value unchanged");
+    assert!(!usage.primary.quota_authoritative);
+    assert_eq!(usage.primary.trusted_used_percent(), None);
+    assert_eq!(
+        usage
+            .primary
+            .authoritative_used_percent(RateWindowCadence::Session),
+        None
+    );
+
+    // The lane that *was* reported keeps its authority.
+    let weekly = usage.secondary.expect("weekly");
+    assert_eq!(
+        weekly.authoritative_used_percent(RateWindowCadence::Weekly),
+        Some(26.0)
+    );
+}
+
+#[test]
+fn present_primary_stays_authoritative() {
+    use crate::core::RateWindowCadence;
+
+    let response: OAuthUsageResponse = serde_json::from_str(
+        r#"{
+            "five_hour": {"utilization": 10.0, "resets_at": "2026-08-13T12:49:59Z"}
+        }"#,
+    )
+    .expect("legacy-only body");
+
+    let credentials = ClaudeOAuthCredentials {
+        access_token: "token".to_string(),
+        refresh_token: None,
+        expires_at: None,
+        scopes: vec![],
+        rate_limit_tier: None,
+    };
+    let usage = ClaudeOAuthFetcher::new().build_usage_snapshot(&response, &credentials);
+
+    assert_eq!(
+        usage
+            .primary
+            .authoritative_used_percent(RateWindowCadence::Session),
+        Some(10.0)
+    );
+}
+
+#[test]
+fn missing_utilization_yields_no_oauth_rate_window() {
+    let window = UsageWindow {
+        utilization: None,
+        resets_at: None,
+    };
+
+    assert!(ClaudeOAuthFetcher::to_rate_window(&window, Some(300)).is_none());
+}

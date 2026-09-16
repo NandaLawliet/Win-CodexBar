@@ -328,12 +328,12 @@ impl ClaudeWebApiFetcher {
             usage
                 .seven_day_oauth_apps
                 .as_ref()
-                .map(|w| self.to_rate_window(w, Some(10080))),
+                .and_then(|w| self.to_rate_window(w, Some(10080))),
             super::scoped_weekly::scoped_weekly_windows(&usage.limits),
             usage
                 .seven_day_routines
                 .as_ref()
-                .map(|w| self.to_rate_window(w, Some(10080))),
+                .and_then(|w| self.to_rate_window(w, Some(10080))),
             show_routines,
         );
 
@@ -589,12 +589,23 @@ impl ClaudeWebApiFetcher {
         parse_json_with_body(response, "account").await
     }
 
-    /// Convert a usage window to a RateWindow
-    fn to_rate_window(&self, window: &UsageWindow, window_minutes: Option<u32>) -> RateWindow {
+    /// Convert a usage window to a RateWindow, or `None` when the lane carries
+    /// no utilization reading.
+    ///
+    /// Mirrors the OAuth path (`oauth::ClaudeOAuthFetcher::to_rate_window`): a
+    /// window object with a missing `utilization` is *absent* quota, not a
+    /// quota that happens to read 0% used. Returning `None` lets each caller
+    /// fall through to its own unavailable representation instead of
+    /// fabricating a favorable percentage.
+    fn to_rate_window(
+        &self,
+        window: &UsageWindow,
+        window_minutes: Option<u32>,
+    ) -> Option<RateWindow> {
         // `utilization` is already expressed in percent units: `1.0` means 1%,
         // not 100%. Treating values <= 1 as fractions reported a 1% session as a
         // fully consumed quota.
-        let used_percent = window.utilization.unwrap_or(0.0);
+        let used_percent = window.utilization?;
 
         let resets_at = window
             .resets_at
@@ -603,7 +614,12 @@ impl ClaudeWebApiFetcher {
 
         let reset_description = resets_at.map(Self::format_reset_time);
 
-        RateWindow::with_details(used_percent, window_minutes, resets_at, reset_description)
+        Some(RateWindow::with_details(
+            used_percent,
+            window_minutes,
+            resets_at,
+            reset_description,
+        ))
     }
 
     /// Build (primary, secondary, model_specific) rate windows from a usage
@@ -627,7 +643,7 @@ impl ClaudeWebApiFetcher {
                 usage
                     .five_hour
                     .as_ref()
-                    .map(|w| self.to_rate_window(w, Some(300))) // 5 hours = 300 minutes
+                    .and_then(|w| self.to_rate_window(w, Some(300))) // 5 hours = 300 minutes
             })
             .unwrap_or_else(RateWindow::no_active_session);
 
@@ -636,13 +652,13 @@ impl ClaudeWebApiFetcher {
             usage
                 .seven_day
                 .as_ref()
-                .map(|w| self.to_rate_window(w, Some(10080))) // 7 days = 10080 minutes
+                .and_then(|w| self.to_rate_window(w, Some(10080))) // 7 days = 10080 minutes
         });
 
         let model_specific = usage
             .seven_day_opus
             .as_ref()
-            .map(|w| self.to_rate_window(w, Some(10080)));
+            .and_then(|w| self.to_rate_window(w, Some(10080)));
 
         (primary, secondary, model_specific)
     }
@@ -778,7 +794,9 @@ mod tests {
             resets_at: None,
         };
 
-        let rate = ClaudeWebApiFetcher::new().to_rate_window(&window, Some(300));
+        let rate = ClaudeWebApiFetcher::new()
+            .to_rate_window(&window, Some(300))
+            .expect("utilization present");
 
         assert!((rate.used_percent - 0.23).abs() < f64::EPSILON);
     }
@@ -790,7 +808,9 @@ mod tests {
             resets_at: None,
         };
 
-        let rate = ClaudeWebApiFetcher::new().to_rate_window(&window, Some(300));
+        let rate = ClaudeWebApiFetcher::new()
+            .to_rate_window(&window, Some(300))
+            .expect("utilization present");
 
         assert!(
             (rate.used_percent - 1.0).abs() < f64::EPSILON,
@@ -811,14 +831,90 @@ mod tests {
         );
 
         // Real idle session (object present at 0%) stays unflagged.
-        let idle = ClaudeWebApiFetcher::new().to_rate_window(
-            &UsageWindow {
-                utilization: Some(0.0),
-                resets_at: None,
-            },
-            Some(300),
-        );
+        let idle = ClaudeWebApiFetcher::new()
+            .to_rate_window(
+                &UsageWindow {
+                    utilization: Some(0.0),
+                    resets_at: None,
+                },
+                Some(300),
+            )
+            .expect("explicit 0% utilization is a real reading");
         assert!(!idle.is_informational);
+        assert!(idle.quota_authoritative);
+    }
+
+    // ── Quota-authority regressions ───────────────────────────────────────
+
+    #[test]
+    fn missing_utilization_is_absent_quota_not_zero_percent() {
+        // Symmetry with the OAuth path: a window object without `utilization`
+        // is missing quota, not a quota that happens to read 0% used.
+        let window = UsageWindow {
+            utilization: None,
+            resets_at: None,
+        };
+
+        assert!(
+            ClaudeWebApiFetcher::new()
+                .to_rate_window(&window, Some(300))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn missing_utilization_never_becomes_an_authoritative_healthy_lane() {
+        use crate::core::RateWindowCadence;
+
+        let usage: super::UsageResponse = serde_json::from_str(
+            r#"{
+                "five_hour": {},
+                "seven_day": {},
+                "seven_day_opus": {}
+            }"#,
+        )
+        .unwrap();
+
+        let (primary, secondary, model_specific) =
+            ClaudeWebApiFetcher::new().build_rate_windows(&usage);
+
+        // Primary falls through to the informational 5h placeholder.
+        assert!(primary.is_informational);
+        assert!(!primary.quota_authoritative);
+        assert_eq!(
+            primary.authoritative_used_percent(RateWindowCadence::Session),
+            None
+        );
+
+        // Secondary / model lanes stay absent rather than fabricating 0% used.
+        assert!(secondary.is_none());
+        assert!(model_specific.is_none());
+    }
+
+    #[test]
+    fn present_utilization_stays_authoritative() {
+        use crate::core::RateWindowCadence;
+
+        let usage: super::UsageResponse = serde_json::from_str(
+            r#"{
+                "five_hour": { "utilization": 5 },
+                "seven_day": { "utilization": 26 }
+            }"#,
+        )
+        .unwrap();
+
+        let (primary, secondary, _) = ClaudeWebApiFetcher::new().build_rate_windows(&usage);
+
+        assert_eq!(
+            primary.authoritative_used_percent(RateWindowCadence::Session),
+            Some(5.0)
+        );
+        assert_eq!(
+            secondary
+                .expect("weekly present")
+                .authoritative_used_percent(RateWindowCadence::Weekly),
+            Some(26.0)
+        );
     }
 
     #[test]
@@ -828,7 +924,9 @@ mod tests {
             resets_at: None,
         };
 
-        let rate = ClaudeWebApiFetcher::new().to_rate_window(&window, Some(300));
+        let rate = ClaudeWebApiFetcher::new()
+            .to_rate_window(&window, Some(300))
+            .expect("utilization present");
 
         assert!((rate.used_percent - 23.0).abs() < f64::EPSILON);
     }
@@ -964,12 +1062,12 @@ mod tests {
         let design = usage
             .seven_day_design
             .as_ref()
-            .map(|w| fetcher.to_rate_window(w, Some(10080)))
+            .and_then(|w| fetcher.to_rate_window(w, Some(10080)))
             .expect("design window");
         let routines = usage
             .seven_day_routines
             .as_ref()
-            .map(|w| fetcher.to_rate_window(w, Some(10080)))
+            .and_then(|w| fetcher.to_rate_window(w, Some(10080)))
             .expect("routines window");
 
         assert!((design.used_percent - 26.0).abs() < f64::EPSILON);
@@ -1014,12 +1112,12 @@ mod tests {
         let design = usage
             .seven_day_design
             .as_ref()
-            .map(|w| fetcher.to_rate_window(w, Some(10080)))
+            .and_then(|w| fetcher.to_rate_window(w, Some(10080)))
             .expect("design window");
         let routines = usage
             .seven_day_routines
             .as_ref()
-            .map(|w| fetcher.to_rate_window(w, Some(10080)))
+            .and_then(|w| fetcher.to_rate_window(w, Some(10080)))
             .expect("routines window");
 
         assert!((design.used_percent - 31.0).abs() < f64::EPSILON);
@@ -1046,7 +1144,7 @@ mod tests {
         let oauth_apps = usage
             .seven_day_oauth_apps
             .as_ref()
-            .map(|w| fetcher.to_rate_window(w, Some(10080)))
+            .and_then(|w| fetcher.to_rate_window(w, Some(10080)))
             .expect("oauth apps window");
         let extra = usage.extra_usage.expect("extra usage");
 

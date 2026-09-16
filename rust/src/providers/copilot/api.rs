@@ -455,12 +455,17 @@ impl UsableQuota {
     fn to_rate_window(&self, reset: Option<DateTime<Utc>>) -> RateWindow {
         let used_percent = (100.0 - self.percent_remaining).max(0.0);
         let reset_description = (used_percent > 100.0).then(|| format!("{used_percent:.0}% used"));
+        // Copilot reports overage above 100%, and the raw value is what the UI
+        // renders — so this lane keeps the literal instead of routing through
+        // the clamping constructors. Quota authority still follows the shared
+        // rule: only an in-range percent may back a security decision.
         RateWindow {
             used_percent,
             window_minutes: None,
             resets_at: reset,
             reset_description,
             is_informational: false,
+            quota_authoritative: RateWindow::percent_is_trustworthy(used_percent),
         }
     }
 }

@@ -418,18 +418,25 @@ impl CodexApi {
         let used_percent = json
             .get("used_percent")
             .or_else(|| json.get("usage_percent"))
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
+            .and_then(|v| v.as_f64());
 
-        (RateWindow::new(used_percent), None, None, None)
+        // A missing percentage is not a 0%-used quota: keep the historical
+        // placeholder value but strip quota authority.
+        let window = RateWindow::new(used_percent.unwrap_or(0.0))
+            .with_quota_authority(used_percent.is_some());
+
+        (window, None, None, None)
     }
 
     fn parse_window(&self, window: &serde_json::Value) -> RateWindow {
-        let used_percent = window
+        // `json_f64` accepts string payloads, and Rust parses `"NaN"` / `"inf"`
+        // into real non-finite floats — so an absent *or* unusable percentage
+        // must lose authority rather than land as a healthy 0% used.
+        let parsed_percent = window
             .get("used_percent")
             .or_else(|| window.get("usage_percent"))
-            .and_then(json_f64)
-            .unwrap_or(0.0);
+            .and_then(json_f64);
+        let used_percent = parsed_percent.unwrap_or(0.0);
 
         let window_minutes = window
             .get("limit_window_seconds")
@@ -447,6 +454,7 @@ impl CodexApi {
             reset_at,
             format_reset_countdown(reset_at),
         )
+        .with_quota_authority(parsed_percent.is_some())
     }
 
     fn parse_window_if_present(&self, window: &serde_json::Value) -> Option<RateWindow> {
@@ -1553,6 +1561,126 @@ mod tests {
         let cost = cost.expect("cost");
         assert_eq!(cost.used, 40.0);
         assert_eq!(cost.limit, Some(100.0));
+    }
+
+    // ── Quota-authority regressions ───────────────────────────────────────
+
+    #[test]
+    fn string_nan_used_percent_is_unavailable_not_healthy() {
+        // `json_f64` accepts string payloads and Rust parses "NaN" into a real
+        // f64 NaN — which would otherwise be stored as an authoritative 0%.
+        let api = CodexApi::new();
+        let window = api.parse_window(&json!({
+            "used_percent": "NaN",
+            "limit_window_seconds": 18_000
+        }));
+
+        assert!(
+            window.used_percent.is_finite(),
+            "NaN must never be retained in used_percent"
+        );
+        assert_eq!(window.used_percent, 0.0);
+        assert!(!window.quota_authoritative);
+        assert_eq!(
+            window.authoritative_used_percent(RateWindowCadence::Session),
+            None
+        );
+    }
+
+    #[test]
+    fn string_infinity_used_percent_is_unavailable_not_healthy() {
+        let api = CodexApi::new();
+        for raw in ["inf", "-inf"] {
+            let window = api.parse_window(&json!({
+                "used_percent": raw,
+                "limit_window_seconds": 18_000
+            }));
+            assert!(window.used_percent.is_finite(), "{raw}");
+            assert!(!window.quota_authoritative, "{raw}");
+        }
+    }
+
+    #[test]
+    fn missing_used_percent_is_not_an_authoritative_zero() {
+        let api = CodexApi::new();
+        let window = api.parse_window(&json!({ "limit_window_seconds": 18_000 }));
+
+        assert_eq!(window.used_percent, 0.0, "display value unchanged");
+        assert!(!window.quota_authoritative);
+        assert_eq!(window.trusted_used_percent(), None);
+    }
+
+    #[test]
+    fn unparseable_used_percent_is_not_an_authoritative_zero() {
+        let api = CodexApi::new();
+        let window = api.parse_window(&json!({
+            "used_percent": "not-a-number",
+            "limit_window_seconds": 18_000
+        }));
+
+        assert_eq!(window.used_percent, 0.0);
+        assert!(!window.quota_authoritative);
+    }
+
+    #[test]
+    fn negative_used_percent_cannot_report_full_remaining() {
+        let api = CodexApi::new();
+        let window = api.parse_window(&json!({
+            "used_percent": -20.0,
+            "limit_window_seconds": 18_000
+        }));
+
+        assert_eq!(window.used_percent, 0.0, "clamp behavior unchanged");
+        assert_eq!(window.remaining_percent(), 100.0);
+        assert_eq!(
+            window.authoritative_used_percent(RateWindowCadence::Session),
+            None,
+            "a clamped negative percent must not read as 100% remaining"
+        );
+    }
+
+    #[test]
+    fn valid_codex_session_window_stays_authoritative() {
+        let api = CodexApi::new();
+        let window = api.parse_window(&json!({
+            "used_percent": 37.5,
+            "limit_window_seconds": 18_000
+        }));
+
+        assert_eq!(window.used_percent, 37.5);
+        assert_eq!(
+            window.authoritative_used_percent(RateWindowCadence::Session),
+            Some(37.5)
+        );
+        assert_eq!(
+            window.authoritative_used_percent(RateWindowCadence::Weekly),
+            None
+        );
+    }
+
+    #[test]
+    fn valid_codex_weekly_window_stays_authoritative() {
+        let api = CodexApi::new();
+        let window = api.parse_window(&json!({
+            "used_percent": 12.0,
+            "limit_window_seconds": 604_800
+        }));
+
+        assert_eq!(
+            window.authoritative_used_percent(RateWindowCadence::Weekly),
+            Some(12.0)
+        );
+    }
+
+    #[test]
+    fn codex_placeholder_primary_is_never_authoritative() {
+        let (primary, _, _, _) = normalize_array_windows(vec![]);
+        assert!(primary.is_informational);
+        assert!(!primary.quota_authoritative);
+        assert_eq!(
+            primary.authoritative_used_percent(RateWindowCadence::Session),
+            None
+        );
     }
 
     fn win(minutes: u32, used: f64) -> RateWindow {

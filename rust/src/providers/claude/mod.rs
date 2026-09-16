@@ -7,7 +7,7 @@ mod scoped_weekly;
 mod web_api;
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use regex_lite::Regex;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -649,10 +649,8 @@ impl ClaudeProvider {
         }
 
         // Build usage snapshot
-        let session_used = session_percent.unwrap_or(0.0);
-        let primary = RateWindow::with_details(
-            session_used,
-            Some(300), // 5 hour session window
+        let primary = cli_session_primary(
+            session_percent,
             session_reset
                 .as_deref()
                 .and_then(|reset| parse_claude_reset_date(reset, now, Some(300))),
@@ -921,6 +919,28 @@ fn extract_percent_near_label(text: &str, label: &str) -> Option<f64> {
     None
 }
 
+/// Build the 5-hour session primary from an optionally-parsed CLI percentage.
+///
+/// When the status line carries a weekly section but no session percentage,
+/// `session_percent` is `None`. The historical `unwrap_or(0.0)` is kept so the
+/// rendered row and the public usage JSON are unchanged — but a percentage the
+/// CLI never printed is a placeholder, not a measurement, so quota authority is
+/// withheld and security-sensitive readers see the lane as unavailable instead
+/// of as a fully-available session.
+fn cli_session_primary(
+    session_percent: Option<f64>,
+    resets_at: Option<DateTime<Utc>>,
+    reset_description: Option<String>,
+) -> RateWindow {
+    RateWindow::with_details(
+        session_percent.unwrap_or(0.0),
+        Some(300), // 5 hour session window
+        resets_at,
+        reset_description,
+    )
+    .with_quota_authority(session_percent.is_some())
+}
+
 /// Extract all percentages from text in order
 fn extract_all_percents(text: &str) -> Vec<f64> {
     let re = match Regex::new(
@@ -1047,6 +1067,7 @@ fn clean_plan_name(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::core::RateWindowCadence;
     use chrono::{DateTime, Utc};
     use std::collections::HashMap;
 
@@ -1510,6 +1531,77 @@ Active days: 2/10              Longest streak: 1 day
             "expired".to_string()
         )));
         assert!(!is_oauth_revoked_error(&ProviderError::AuthRequired));
+    }
+
+    // ── Quota-authority regressions (R1) ──────────────────────────────────
+
+    #[test]
+    fn cli_session_without_a_parsed_percent_is_not_authoritative() {
+        // Weekly parsed, session regex missed: the 0.0 is a placeholder, so it
+        // must never read as an authoritative fully-available 5h session.
+        let primary = cli_session_primary(None, None, None);
+
+        assert_eq!(primary.used_percent, 0.0, "display value is unchanged");
+        assert_eq!(primary.window_minutes, Some(300));
+        assert!(!primary.quota_authoritative);
+        assert_eq!(
+            primary.authoritative_used_percent(RateWindowCadence::Session),
+            None
+        );
+        assert_eq!(primary.trusted_used_percent(), None);
+    }
+
+    #[test]
+    fn cli_session_with_a_parsed_percent_stays_authoritative() {
+        let primary = cli_session_primary(Some(12.5), None, Some("Resets 8pm".to_string()));
+
+        assert_eq!(primary.used_percent, 12.5);
+        assert!(primary.quota_authoritative);
+        assert_eq!(
+            primary.authoritative_used_percent(RateWindowCadence::Session),
+            Some(12.5)
+        );
+    }
+
+    #[test]
+    fn cli_session_placeholder_survives_serialization_without_authority() {
+        let primary = cli_session_primary(None, None, None);
+        let json = serde_json::to_string(&primary).expect("serialize");
+        assert!(!json.contains("quota_authoritative"));
+
+        let restored: RateWindow = serde_json::from_str(&json).expect("deserialize");
+        assert!(!restored.quota_authoritative);
+    }
+
+    #[test]
+    fn parsed_cli_usage_keeps_authoritative_session_and_weekly() {
+        let provider = ClaudeProvider::new();
+        let output = r#"
+Status   Config   Usage
+
+  Current session
+  12.5% used
+  Resets 8pm
+
+  Current week (all models)
+  4% used
+  Resets Apr 4, 2pm
+"#;
+
+        let result = provider.parse_cli_output(output).expect("should parse");
+
+        assert_eq!(
+            result
+                .usage
+                .primary
+                .authoritative_used_percent(RateWindowCadence::Session),
+            Some(12.5)
+        );
+        let weekly = result.usage.secondary.expect("weekly present");
+        assert_eq!(
+            weekly.authoritative_used_percent(RateWindowCadence::Weekly),
+            Some(4.0)
+        );
     }
 
     #[test]

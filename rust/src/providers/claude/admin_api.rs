@@ -221,27 +221,33 @@ fn result_from_admin_usage(
         })
         .map(|dt| dt.with_timezone(&Utc));
 
-    let mut usage = UsageSnapshot::new(RateWindow::with_details(
-        0.0,
-        None,
-        start,
-        Some(format!("${cost_total:.2} over last 30 days")),
-    ))
-    .with_secondary(RateWindow::with_details(
-        0.0,
-        None,
-        None,
-        Some(format!("{total_tokens} tokens")),
-    ))
+    // The Admin API reports spend and token counts, never a quota percentage.
+    // Every row below is a cost/token pseudo-window whose `0.0` exists only to
+    // satisfy the shape — none of them may claim quota authority.
+    let mut usage = UsageSnapshot::new(
+        RateWindow::with_details(
+            0.0,
+            None,
+            start,
+            Some(format!("${cost_total:.2} over last 30 days")),
+        )
+        .non_authoritative(),
+    )
+    .with_secondary(
+        RateWindow::with_details(0.0, None, None, Some(format!("{total_tokens} tokens")))
+            .non_authoritative(),
+    )
     .with_extra_rate_window(
         "input-tokens",
         "Input tokens",
-        RateWindow::with_details(0.0, None, None, Some(format!("{input_tokens}"))),
+        RateWindow::with_details(0.0, None, None, Some(format!("{input_tokens}")))
+            .non_authoritative(),
     )
     .with_extra_rate_window(
         "output-tokens",
         "Output tokens",
-        RateWindow::with_details(0.0, None, None, Some(format!("{output_tokens}"))),
+        RateWindow::with_details(0.0, None, None, Some(format!("{output_tokens}")))
+            .non_authoritative(),
     )
     .with_login_method("Admin API");
     usage.updated_at = now;
@@ -270,7 +276,8 @@ fn result_from_admin_usage(
         usage = usage.with_extra_rate_window(
             format!("model-{idx}"),
             format!("Model: {model}"),
-            RateWindow::with_details(0.0, None, None, Some(format!("{tokens} tokens"))),
+            RateWindow::with_details(0.0, None, None, Some(format!("{tokens} tokens")))
+                .non_authoritative(),
         );
     }
 
@@ -291,7 +298,8 @@ fn result_from_admin_usage(
         usage = usage.with_extra_rate_window(
             format!("cost-{idx}"),
             format!("Cost: {item}"),
-            RateWindow::with_details(0.0, None, None, Some(format!("${cost:.2}"))),
+            RateWindow::with_details(0.0, None, None, Some(format!("${cost:.2}")))
+                .non_authoritative(),
         );
     }
 
@@ -309,6 +317,65 @@ fn usd_from_lowest_unit(raw: &str) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Quota-authority regressions ───────────────────────────────────────
+
+    #[test]
+    fn cost_only_pseudo_windows_are_never_authoritative_quota() {
+        use crate::core::RateWindowCadence;
+
+        let costs: CostReportResponse = serde_json::from_str(
+            r#"{"data": [{
+                "starting_at": "2026-02-01T00:00:00Z",
+                "ending_at": "2026-02-02T00:00:00Z",
+                "results": [{"amount": "1234", "description": "Claude Sonnet", "cost_type": null}]
+            }]}"#,
+        )
+        .expect("cost report");
+        let messages: MessagesUsageResponse = serde_json::from_str(
+            r#"{"data": [{
+                "starting_at": "2026-02-01T00:00:00Z",
+                "ending_at": "2026-02-02T00:00:00Z",
+                "results": [{
+                    "model": "claude-sonnet-4",
+                    "uncached_input_tokens": 100,
+                    "cache_read_input_tokens": 0,
+                    "output_tokens": 50,
+                    "cache_creation": null
+                }]
+            }]}"#,
+        )
+        .expect("messages report");
+
+        let result = result_from_admin_usage(&costs, &messages, Utc::now());
+        let usage = result.usage;
+
+        // The Admin API reports spend, not a quota percentage: every row is a
+        // 0.0 placeholder that must not read as a fully-available quota.
+        assert_eq!(usage.primary.used_percent, 0.0);
+        assert!(!usage.primary.quota_authoritative);
+        assert_eq!(usage.primary.trusted_used_percent(), None);
+        assert_eq!(
+            usage
+                .primary
+                .authoritative_used_percent(RateWindowCadence::Session),
+            None
+        );
+
+        let secondary = usage.secondary.expect("token total row");
+        assert!(!secondary.quota_authoritative);
+        assert_eq!(secondary.trusted_used_percent(), None);
+
+        assert!(!usage.extra_rate_windows.is_empty());
+        for extra in &usage.extra_rate_windows {
+            assert!(
+                !extra.window.quota_authoritative,
+                "{} must not claim quota authority",
+                extra.id
+            );
+            assert_eq!(extra.window.trusted_used_percent(), None);
+        }
+    }
 
     #[test]
     fn cleans_quoted_admin_key() {

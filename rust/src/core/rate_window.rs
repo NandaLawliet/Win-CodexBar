@@ -84,17 +84,42 @@ pub struct RateWindow {
     /// Whether this row is an informational value rather than a quota.
     #[serde(default)]
     pub is_informational: bool,
+
+    /// Whether `used_percent` came from a real, in-process upstream quota
+    /// reading — **in-memory provenance only, never serialized**.
+    ///
+    /// # Fail-closed invariant
+    ///
+    /// `#[serde(skip)]` means this flag is neither written to nor read from
+    /// JSON. A `RateWindow` rebuilt from any serialized snapshot therefore
+    /// comes back **non-authoritative** (`false`), and security-sensitive
+    /// consumers must treat it as unavailable rather than as a healthy quota.
+    /// Authority is something a constructor grants from a live upstream value;
+    /// it is never inferred from a byte stream.
+    ///
+    /// This deliberately differs from [`NamedRateWindow::usage_known`], which
+    /// defaults to `true` on deserialize: that field is presentation metadata,
+    /// this one is quota authority, so the two must not share a default.
+    ///
+    /// Read it through [`RateWindow::authoritative_used_percent`] rather than
+    /// directly — the flag alone is not sufficient proof of a usable quota.
+    ///
+    /// [`NamedRateWindow::usage_known`]: crate::core::NamedRateWindow::usage_known
+    #[serde(skip)]
+    pub quota_authoritative: bool,
 }
 
 impl RateWindow {
     /// Create a new rate window
     pub fn new(used_percent: f64) -> Self {
+        let (used_percent, quota_authoritative) = Self::normalize_percent(used_percent);
         Self {
-            used_percent: Self::finite_percent(used_percent),
+            used_percent,
             window_minutes: None,
             resets_at: None,
             reset_description: None,
             is_informational: false,
+            quota_authoritative,
         }
     }
 
@@ -103,7 +128,7 @@ impl RateWindow {
         Self {
             reset_description: Some(description.into()),
             is_informational: true,
-            ..Self::new(0.0)
+            ..Self::new(0.0).non_authoritative()
         }
     }
 
@@ -127,12 +152,109 @@ impl RateWindow {
         resets_at: Option<DateTime<Utc>>,
         reset_description: Option<String>,
     ) -> Self {
+        let (used_percent, quota_authoritative) = Self::normalize_percent(used_percent);
         Self {
-            used_percent: Self::finite_percent(used_percent),
+            used_percent,
             window_minutes,
             resets_at,
             reset_description,
             is_informational: false,
+            quota_authoritative,
+        }
+    }
+
+    /// Record whether the caller's own provenance supports quota authority.
+    ///
+    /// Authority is **granted only at construction**, from a finite, in-range
+    /// upstream value. This builder can only ever *narrow* it: passing `true`
+    /// keeps whatever the constructor already established, it never re-grants
+    /// it. That matters because a rejected input is stored as a `0.0`
+    /// placeholder, which is numerically indistinguishable from a genuine 0% —
+    /// so laundering must be impossible by construction, not by revalidating
+    /// the stored number.
+    ///
+    /// The usual shape is `RateWindow::with_details(..).with_quota_authority(
+    /// parsed.is_some())`: valid parse keeps authority, missing parse drops it.
+    #[must_use]
+    pub fn with_quota_authority(mut self, authoritative: bool) -> Self {
+        self.quota_authoritative &= authoritative;
+        self
+    }
+
+    /// Mark this window as fabricated, missing, or unparseable quota.
+    ///
+    /// Use this at every site that invents a percentage the provider did not
+    /// actually report (`unwrap_or(0.0)` fallbacks, cost-only pseudo-windows,
+    /// "no limits configured" placeholders). The numeric value and the public
+    /// JSON stay exactly as they were; only the security provenance drops.
+    #[must_use]
+    pub fn non_authoritative(self) -> Self {
+        self.with_quota_authority(false)
+    }
+
+    /// The one fail-closed accessor for security-sensitive quota decisions.
+    ///
+    /// Returns `Some(used_percent)` only when **every** condition holds:
+    ///
+    /// - quota authority was explicitly established in-process
+    ///   ([`Self::quota_authoritative`]),
+    /// - the row is a real quota, not an informational placeholder,
+    /// - `used_percent` is finite,
+    /// - `used_percent` is within the inclusive range `[0, 100]`,
+    /// - `window_minutes` is present,
+    /// - and that duration classifies as `expected` under
+    ///   [`RateWindowCadence::from_minutes`].
+    ///
+    /// Anything else — including a window that declares a *different* cadence
+    /// than the caller asked for — yields `None`. The check inspects only
+    /// `self`: it never scans sibling windows, never promotes another lane, and
+    /// contains no provider-specific branching.
+    pub fn authoritative_used_percent(&self, expected: RateWindowCadence) -> Option<f64> {
+        let used_percent = self.trusted_used_percent()?;
+        let minutes = self.window_minutes?;
+        (RateWindowCadence::from_minutes(minutes) == expected).then_some(used_percent)
+    }
+
+    /// Cadence-agnostic core of [`Self::authoritative_used_percent`].
+    ///
+    /// Applies every authority gate except the cadence match, for the one
+    /// consumer whose contract selects windows by snapshot slot rather than by
+    /// declared duration (see `cli::guard`). Prefer
+    /// [`Self::authoritative_used_percent`] whenever an expected cadence is
+    /// known.
+    pub fn trusted_used_percent(&self) -> Option<f64> {
+        if !self.quota_authoritative || self.is_informational {
+            return None;
+        }
+        Self::percent_is_trustworthy(self.used_percent).then_some(self.used_percent)
+    }
+
+    /// Whether a percent value may back an authoritative quota reading.
+    ///
+    /// Finite and inside the inclusive `[0, 100]` band. Non-finite values and
+    /// out-of-range values are rejected even after clamping, because the
+    /// clamped number is a fabrication rather than a measurement.
+    pub(crate) fn percent_is_trustworthy(value: f64) -> bool {
+        value.is_finite() && (0.0..=100.0).contains(&value)
+    }
+
+    /// Normalize a constructor input into `(stored_percent, authoritative)`.
+    ///
+    /// - Valid `[0, 100]` inputs are stored bit-for-bit and stay authoritative.
+    /// - Finite out-of-range inputs keep the historical clamp but lose
+    ///   authority: a clamped number is not a measurement.
+    /// - Non-finite inputs are **never retained** — NaN and ±Infinity serialize
+    ///   to JSON `null` (breaking the `f64` schema) and read as "plenty of
+    ///   headroom" in every naive comparison. They collapse to a safe `0.0`
+    ///   placeholder that is simultaneously marked non-authoritative, so no
+    ///   security-sensitive accessor can ever return it.
+    fn normalize_percent(value: f64) -> (f64, bool) {
+        if !value.is_finite() {
+            (0.0, false)
+        } else if Self::percent_is_trustworthy(value) {
+            (value, true)
+        } else {
+            (value.clamp(0.0, 100.0), false)
         }
     }
 
@@ -195,14 +317,6 @@ impl RateWindow {
             Some(format!("{}m", minutes))
         }
     }
-
-    fn finite_percent(value: f64) -> f64 {
-        if value.is_finite() {
-            value.clamp(0.0, 100.0)
-        } else {
-            0.0
-        }
-    }
 }
 
 /// Subtract one Gregorian calendar month in UTC (upstream Calendar.date(byAdding: .month, -1)).
@@ -235,8 +349,10 @@ fn days_in_month(year: i32, month: u32) -> u32 {
 }
 
 impl Default for RateWindow {
+    /// A defaulted window carries no upstream reading, so its `0.0` is a
+    /// placeholder rather than a measurement — it is never authoritative.
     fn default() -> Self {
-        Self::new(0.0)
+        Self::new(0.0).non_authoritative()
     }
 }
 
@@ -381,5 +497,304 @@ mod tests {
         assert_eq!(RateWindowCadence::Weekly.label_key(), "weekly");
         assert_eq!(RateWindowCadence::Monthly.label_key(), "monthly");
         assert_eq!(RateWindowCadence::Unknown.label_key(), "unknown");
+    }
+
+    // ---------------------------------------------------------------------
+    // Quota-authority hardening.
+    //
+    // Invariant under test: invalid or unknown authority moves toward
+    // unavailable / `None`, never toward a more favorable remaining percentage.
+    // ---------------------------------------------------------------------
+
+    fn session(used_percent: f64) -> RateWindow {
+        RateWindow::with_details(used_percent, Some(SESSION_WINDOW_MINUTES), None, None)
+    }
+
+    // --- A. valid numeric authority -------------------------------------
+
+    #[test]
+    fn authority_zero_percent_stays_authoritative_zero() {
+        let window = session(0.0);
+        assert!(window.quota_authoritative);
+        assert_eq!(window.used_percent, 0.0);
+        assert_eq!(
+            window.authoritative_used_percent(RateWindowCadence::Session),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn authority_hundred_percent_stays_authoritative_hundred() {
+        let window = session(100.0);
+        assert!(window.quota_authoritative);
+        assert_eq!(
+            window.authoritative_used_percent(RateWindowCadence::Session),
+            Some(100.0)
+        );
+    }
+
+    #[test]
+    fn authority_preserves_valid_percents_bit_for_bit() {
+        for value in [37.5_f64, 0.4_f64] {
+            let window = session(value);
+            assert_eq!(
+                window.used_percent, value,
+                "{value} must not be rounded or truncated"
+            );
+            assert_eq!(
+                window.authoritative_used_percent(RateWindowCadence::Session),
+                Some(value)
+            );
+        }
+    }
+
+    #[test]
+    fn authority_requires_the_expected_cadence() {
+        let window = session(37.5);
+        assert_eq!(
+            window.authoritative_used_percent(RateWindowCadence::Weekly),
+            None,
+            "a 300-minute window is never weekly authority"
+        );
+        assert_eq!(
+            window.authoritative_used_percent(RateWindowCadence::Monthly),
+            None
+        );
+        assert_eq!(
+            window.authoritative_used_percent(RateWindowCadence::Unknown),
+            None
+        );
+    }
+
+    // --- B. invalid numeric authority -----------------------------------
+
+    #[test]
+    fn nan_never_becomes_authoritative_zero() {
+        let window = session(f64::NAN);
+        assert!(
+            window.used_percent.is_finite(),
+            "NaN must not be retained: it serializes to JSON null"
+        );
+        assert_eq!(window.used_percent, 0.0);
+        assert!(!window.quota_authoritative);
+        assert_eq!(
+            window.authoritative_used_percent(RateWindowCadence::Session),
+            None
+        );
+        assert_eq!(window.trusted_used_percent(), None);
+    }
+
+    #[test]
+    fn positive_infinity_never_becomes_authoritative_zero() {
+        let window = session(f64::INFINITY);
+        assert!(window.used_percent.is_finite());
+        assert_eq!(window.used_percent, 0.0);
+        assert!(!window.quota_authoritative);
+        assert_eq!(
+            window.authoritative_used_percent(RateWindowCadence::Session),
+            None
+        );
+    }
+
+    #[test]
+    fn negative_infinity_never_becomes_authoritative_zero() {
+        let window = session(f64::NEG_INFINITY);
+        assert!(window.used_percent.is_finite());
+        assert_eq!(window.used_percent, 0.0);
+        assert!(!window.quota_authoritative);
+        assert_eq!(
+            window.authoritative_used_percent(RateWindowCadence::Session),
+            None
+        );
+    }
+
+    #[test]
+    fn out_of_range_percents_are_unavailable_even_after_clamping() {
+        // Historical clamp is preserved for display; authority is not.
+        let low = session(-0.1);
+        assert_eq!(low.used_percent, 0.0);
+        assert!(!low.quota_authoritative);
+        assert_eq!(
+            low.authoritative_used_percent(RateWindowCadence::Session),
+            None
+        );
+
+        let high = session(100.1);
+        assert_eq!(high.used_percent, 100.0);
+        assert!(!high.quota_authoritative);
+        assert_eq!(
+            high.authoritative_used_percent(RateWindowCadence::Session),
+            None
+        );
+    }
+
+    #[test]
+    fn negative_percent_cannot_report_full_remaining_headroom() {
+        // The -50% → clamp(0) → "100% remaining" laundering path.
+        let window = session(-50.0);
+        assert_eq!(window.remaining_percent(), 100.0);
+        assert_eq!(
+            window.authoritative_used_percent(RateWindowCadence::Session),
+            None,
+            "a clamped negative percent must not read as a fully-available quota"
+        );
+    }
+
+    #[test]
+    fn authority_cannot_be_regranted_after_construction_denied_it() {
+        // The NaN placeholder stores a perfectly valid-looking 0.0, so the
+        // builder must not be able to revalidate its way back to authority.
+        let window = session(f64::NAN).with_quota_authority(true);
+        assert!(
+            !window.quota_authoritative,
+            "with_quota_authority may only narrow authority, never launder it"
+        );
+        assert_eq!(
+            window.authoritative_used_percent(RateWindowCadence::Session),
+            None
+        );
+
+        let window = session(150.0).with_quota_authority(true);
+        assert!(!window.quota_authoritative);
+
+        let window = RateWindow::informational("note").with_quota_authority(true);
+        assert!(!window.quota_authoritative);
+    }
+
+    // --- C. missing authority (shared shapes) ---------------------------
+
+    #[test]
+    fn informational_rows_are_never_authoritative() {
+        let informational = RateWindow::informational("¥12.00");
+        assert!(!informational.quota_authoritative);
+        assert_eq!(informational.trusted_used_percent(), None);
+
+        let placeholder = RateWindow::no_active_session();
+        assert!(!placeholder.quota_authoritative);
+        assert_eq!(
+            placeholder.authoritative_used_percent(RateWindowCadence::Session),
+            None
+        );
+    }
+
+    #[test]
+    fn defaulted_window_is_not_authoritative() {
+        let window = RateWindow::default();
+        assert_eq!(window.used_percent, 0.0);
+        assert!(!window.quota_authoritative);
+        assert_eq!(window.trusted_used_percent(), None);
+    }
+
+    #[test]
+    fn missing_window_minutes_has_no_cadence_authority() {
+        let window = RateWindow::new(20.0);
+        assert!(window.quota_authoritative);
+        assert_eq!(window.trusted_used_percent(), Some(20.0));
+        assert_eq!(
+            window.authoritative_used_percent(RateWindowCadence::Session),
+            None,
+            "cadence authority requires a declared window_minutes"
+        );
+    }
+
+    // --- D. cadence ------------------------------------------------------
+
+    #[test]
+    fn cadence_authority_matrix() {
+        let cases = [
+            (300_u32, RateWindowCadence::Session, true),
+            (300, RateWindowCadence::Weekly, false),
+            (10_080, RateWindowCadence::Weekly, true),
+            (20_160, RateWindowCadence::Weekly, true),
+            (43_199, RateWindowCadence::Weekly, true),
+            (43_200, RateWindowCadence::Weekly, false),
+            (43_200, RateWindowCadence::Monthly, true),
+        ];
+
+        for (minutes, expected, authoritative) in cases {
+            let window = RateWindow::with_details(42.0, Some(minutes), None, None);
+            assert_eq!(
+                window.authoritative_used_percent(expected).is_some(),
+                authoritative,
+                "{minutes} minutes vs {expected:?}"
+            );
+        }
+    }
+
+    // --- E. serialization / authority boundary ---------------------------
+
+    #[test]
+    fn authority_does_not_survive_a_json_round_trip() {
+        let original = session(37.5);
+        assert!(original.quota_authoritative);
+
+        let json = serde_json::to_string(&original).expect("serialize");
+        assert!(
+            !json.contains("quota_authoritative"),
+            "authority must stay out of the public usage JSON: {json}"
+        );
+
+        let restored: RateWindow = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            restored.used_percent, 37.5,
+            "the public value round-trips unchanged"
+        );
+        assert!(
+            !restored.quota_authoritative,
+            "deserialization must fail closed — authority is never inferred from bytes"
+        );
+        assert_eq!(
+            restored.authoritative_used_percent(RateWindowCadence::Session),
+            None
+        );
+        assert_eq!(restored.trusted_used_percent(), None);
+    }
+
+    #[test]
+    fn public_usage_json_schema_is_unchanged() {
+        let window = RateWindow::with_details(
+            37.5,
+            Some(300),
+            Some(Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).unwrap()),
+            Some("Mar 1".to_string()),
+        );
+        let value = serde_json::to_value(&window).expect("serialize");
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "is_informational",
+                "reset_description",
+                "resets_at",
+                "used_percent",
+                "window_minutes",
+            ]
+        );
+
+        // Optional fields still collapse out of the payload when absent.
+        let sparse = serde_json::to_value(RateWindow::new(1.0)).expect("serialize");
+        let mut sparse_keys: Vec<&str> = sparse
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        sparse_keys.sort_unstable();
+        assert_eq!(sparse_keys, ["is_informational", "used_percent"]);
+    }
+
+    #[test]
+    fn non_finite_percent_is_never_serialized_as_null() {
+        // serde_json renders NaN/±Infinity as `null`, which would break the
+        // `f64` contract for every downstream consumer.
+        let json = serde_json::to_value(session(f64::NAN)).expect("serialize");
+        assert_eq!(json["used_percent"], serde_json::json!(0.0));
+        assert!(json["used_percent"].is_number());
     }
 }
