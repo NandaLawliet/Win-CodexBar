@@ -267,6 +267,12 @@ describe("FloatBar", () => {
     expect(floatBarCss).toMatch(
       /\.floatbar--horizontal \.floatbar__refresh\s*\{[^}]*order:\s*-1;/s,
     );
+    // The sibling quota separator must stay scoped to vertical, otherwise it
+    // paints a stray dark line before Weekly in the compact horizontal layout.
+    expect(floatBarCss).toMatch(
+      /\.floatbar--vertical \.floatbar__quota \+ \.floatbar__quota\s*\{[^}]*border-left-color:\s*currentColor;/s,
+    );
+    expect(floatBarCss).not.toMatch(/^\.floatbar__quota \+ \.floatbar__quota\s*\{/m);
   });
 
   it("hot-updates orientation without remounting or reordering providers", async () => {

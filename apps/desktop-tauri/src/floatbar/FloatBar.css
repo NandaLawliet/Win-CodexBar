@@ -385,7 +385,13 @@ body.floatbar-window #root {
   align-items: center;
   gap: calc(5px * var(--floatbar-scale, 1));
 }
-.floatbar__quota + .floatbar__quota {
+/* The sibling separator only belongs to the stacked vertical presentation. In
+ * horizontal mode the quota cells already sit flush side by side, so the rule
+ * paints a stray dark scratch before Weekly — and, because it outranks the
+ * warn/critical border colors, it also punches a wrong-toned left edge into
+ * those boxes. Scope it to vertical so horizontal keeps each cell's own
+ * border color on all four edges. */
+.floatbar--vertical .floatbar__quota + .floatbar__quota {
   border-left-color: currentColor;
 }
 .floatbar__quota-label {
