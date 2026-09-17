@@ -1,4 +1,5 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { readFileSync } from "node:fs";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const tauriMocks = vi.hoisted(() => ({
@@ -253,6 +254,66 @@ describe("FloatBar", () => {
       eventMocks.listeners.set(event, listeners);
       return Promise.resolve(() => {});
     });
+  });
+
+  it("keeps the horizontal layout contract unwrapped with independent pill grids", () => {
+    const floatBarCss = readFileSync("src/floatbar/FloatBar.css", "utf8");
+    expect(floatBarCss).toMatch(
+      /\.floatbar--horizontal \.floatbar__providers\s*\{[^}]*display:\s*inline-flex;[^}]*flex-flow:\s*row nowrap;/s,
+    );
+    expect(floatBarCss).toMatch(
+      /\.floatbar--horizontal \.floatbar__pill\s*\{[^}]*grid-column:\s*auto;[^}]*grid-template-columns:\s*minmax\([^}]*minmax\([^}]*minmax\(/s,
+    );
+    expect(floatBarCss).toMatch(
+      /\.floatbar--horizontal \.floatbar__refresh\s*\{[^}]*order:\s*-1;/s,
+    );
+  });
+
+  it("hot-updates orientation without remounting or reordering providers", async () => {
+    const enabledProviders = ["zai", "codex", "claude"];
+    tauriMocks.getCachedProviders.mockResolvedValue([
+      snapshot("claude", "Claude", 20),
+      snapshot("codex", "Codex", 75),
+      zaiSnapshot(),
+    ]);
+
+    const { container } = renderFloatBar(
+      bootstrap({ enabledProviders, floatBarOrientation: "horizontal" }),
+    );
+    await waitFor(() => {
+      expect(container.querySelectorAll(".floatbar__pill")).toHaveLength(3);
+      expect(eventMocks.listeners.get("float-bar-config-changed")).toHaveLength(1);
+    });
+
+    const bar = container.querySelector(".floatbar");
+    const providerOrder = () =>
+      Array.from(container.querySelectorAll(".floatbar__identity")).map((row) =>
+        row.textContent?.trim(),
+      );
+    expect(bar).toHaveClass("floatbar--horizontal");
+    expect(bar).not.toHaveClass("floatbar--vertical");
+    expect(providerOrder()).toEqual(["z.ai", "Codex", "Claude"]);
+
+    const emitConfigChanged = () => {
+      for (const listener of eventMocks.listeners.get("float-bar-config-changed") ?? []) {
+        listener({ payload: {} });
+      }
+    };
+    tauriMocks.getSettingsSnapshot.mockResolvedValueOnce(
+      settings({ enabledProviders, floatBarOrientation: "vertical" }),
+    );
+    act(emitConfigChanged);
+    await waitFor(() => expect(bar).toHaveClass("floatbar--vertical"));
+    expect(container.querySelector(".floatbar")).toBe(bar);
+    expect(providerOrder()).toEqual(["z.ai", "Codex", "Claude"]);
+
+    tauriMocks.getSettingsSnapshot.mockResolvedValueOnce(
+      settings({ enabledProviders, floatBarOrientation: "horizontal" }),
+    );
+    act(emitConfigChanged);
+    await waitFor(() => expect(bar).toHaveClass("floatbar--horizontal"));
+    expect(container.querySelector(".floatbar")).toBe(bar);
+    expect(providerOrder()).toEqual(["z.ai", "Codex", "Claude"]);
   });
 
   it("renders a pill per enabled provider, sorted by usage descending", async () => {

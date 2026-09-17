@@ -359,6 +359,26 @@ body.floatbar-window #root {
     minmax(calc(110px * var(--floatbar-scale, 1)), max-content);
   gap: calc(4px * var(--floatbar-scale, 1));
 }
+.floatbar--horizontal {
+  display: inline-flex;
+  flex-flow: row nowrap;
+}
+.floatbar--horizontal > * {
+  flex: none;
+}
+.floatbar--horizontal .floatbar__providers {
+  display: inline-flex;
+  flex-flow: row nowrap;
+}
+.floatbar--horizontal .floatbar__pill {
+  grid-column: auto;
+  grid-template-columns: minmax(calc(76px * var(--floatbar-scale, 1)), max-content)
+    minmax(calc(90px * var(--floatbar-scale, 1)), max-content)
+    minmax(calc(110px * var(--floatbar-scale, 1)), max-content);
+}
+.floatbar--horizontal .floatbar__refresh {
+  order: -1;
+}
 .floatbar__identity {
   display: inline-flex;
   align-items: center;
