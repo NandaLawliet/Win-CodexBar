@@ -370,11 +370,12 @@ body.floatbar-window #root {
   display: inline-flex;
   flex-flow: row nowrap;
 }
+/* Horizontal pills sit side by side, so they never need the vertical mode's
+ * shared column floors — those only pad each pill with dead space. Size the
+ * identity/session/weekly tracks to their content instead. */
 .floatbar--horizontal .floatbar__pill {
   grid-column: auto;
-  grid-template-columns: minmax(calc(76px * var(--floatbar-scale, 1)), max-content)
-    minmax(calc(90px * var(--floatbar-scale, 1)), max-content)
-    minmax(calc(110px * var(--floatbar-scale, 1)), max-content);
+  grid-template-columns: max-content max-content max-content;
 }
 .floatbar--horizontal .floatbar__refresh {
   order: -1;

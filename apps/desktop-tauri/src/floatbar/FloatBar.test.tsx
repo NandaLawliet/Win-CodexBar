@@ -262,7 +262,7 @@ describe("FloatBar", () => {
       /\.floatbar--horizontal \.floatbar__providers\s*\{[^}]*display:\s*inline-flex;[^}]*flex-flow:\s*row nowrap;/s,
     );
     expect(floatBarCss).toMatch(
-      /\.floatbar--horizontal \.floatbar__pill\s*\{[^}]*grid-column:\s*auto;[^}]*grid-template-columns:\s*minmax\([^}]*minmax\([^}]*minmax\(/s,
+      /\.floatbar--horizontal \.floatbar__pill\s*\{[^}]*grid-column:\s*auto;[^}]*grid-template-columns:\s*max-content max-content max-content;/s,
     );
     expect(floatBarCss).toMatch(
       /\.floatbar--horizontal \.floatbar__refresh\s*\{[^}]*order:\s*-1;/s,
