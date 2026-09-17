@@ -315,10 +315,15 @@ fn snapshot_from_response(response: CopilotUsageResponse) -> Result<UsageSnapsho
         ));
     }
 
+    // No usable quota survived parsing (absent, empty, placeholder-only,
+    // malformed, unsupported kinds, or no usable amount). The `0.0` below is a
+    // placeholder to keep the rendered shape, not a reading — absence of quota
+    // evidence is not evidence of 0% usage, so it must never back a quota
+    // decision as a fully available lane.
     let primary = primary_quota
         .as_ref()
         .map(|quota| quota.to_rate_window(reset))
-        .unwrap_or_else(|| RateWindow::new(0.0));
+        .unwrap_or_else(|| RateWindow::new(0.0).non_authoritative());
 
     let mut usage =
         UsageSnapshot::new(primary).with_login_method(plan_label(&response.copilot_plan));
@@ -377,6 +382,21 @@ enum CopilotQuotaKind {
     Chat,
     Completions,
     Other,
+}
+
+/// Decode one `quota_snapshots` entry, accepting **objects only**.
+///
+/// Serde would otherwise also decode a derived struct from a JSON sequence,
+/// positionally: `[80, 20]` becomes `entitlement = 80, remaining = 20` and
+/// yields a fully authoritative 75%-used lane out of an entry that never named
+/// a single field. Quota authority must come from labelled upstream data, not
+/// from element order the API does not declare, so non-object entries degrade
+/// to "no quota here" like any other unusable shape.
+fn decode_quota_snapshot(value: &Value) -> Option<QuotaSnapshot> {
+    if !value.is_object() {
+        return None;
+    }
+    serde_json::from_value::<QuotaSnapshot>(value.clone()).ok()
 }
 
 /// Classify a quota entry by map key + quota_id (shared by window selection
@@ -507,7 +527,7 @@ impl CopilotUsageResponse {
         let mut chat: Option<f64> = None;
         let mut first: Option<f64> = None;
         for (key, value) in &self.quota_snapshots.entries {
-            let Ok(snapshot) = serde_json::from_value::<QuotaSnapshot>(value.clone()) else {
+            let Some(snapshot) = decode_quota_snapshot(value) else {
                 continue;
             };
             let Some(credits) = snapshot.credits_used else {
@@ -537,7 +557,7 @@ impl CopilotUsageResponse {
         let mut quotas = UsableQuotas::default();
 
         for (key, value) in &self.quota_snapshots.entries {
-            let Ok(snapshot) = serde_json::from_value::<QuotaSnapshot>(value.clone()) else {
+            let Some(snapshot) = decode_quota_snapshot(value) else {
                 continue;
             };
             let Some(quota) = UsableQuota::from_snapshot(key, snapshot) else {
@@ -1148,6 +1168,183 @@ mod tests {
             assert_eq!(window.used_percent, 0.0);
             assert_quota_unavailable(raw);
         }
+    }
+
+    // ── No-usable-quota authority (R2 corrective F3) ───────────────────────
+    //
+    // Every response shape that leaves no usable quota lands on the same
+    // primary placeholder. Absence of quota evidence is not evidence of 0%
+    // usage, so that placeholder must stay unavailable rather than render as a
+    // brand-new, fully available lane.
+
+    fn assert_no_usable_quota_is_unavailable(case: &str, json: &str) {
+        let primary = parse_snapshot(json).primary;
+
+        assert!(
+            !primary.quota_authoritative,
+            "{case}: absent quota evidence must not be authoritative"
+        );
+        assert_eq!(
+            primary.trusted_used_percent(),
+            None,
+            "{case}: a missing quota must not back a quota decision"
+        );
+        assert_eq!(
+            guard_remaining_headroom(Some(&primary), RateWindowCadence::Session),
+            None,
+            "{case}: guard must report unavailable rather than favorable headroom"
+        );
+        assert_eq!(
+            serialized_used_percent(&primary),
+            Some(0.0),
+            "{case}: public JSON shape is unchanged"
+        );
+    }
+
+    #[test]
+    fn absent_quota_snapshots_are_not_authoritative() {
+        assert_no_usable_quota_is_unavailable("absent", r#"{ "copilot_plan": "pro" }"#);
+    }
+
+    #[test]
+    fn empty_quota_snapshots_are_not_authoritative() {
+        assert_no_usable_quota_is_unavailable(
+            "empty",
+            r#"{ "copilot_plan": "pro", "quota_snapshots": {} }"#,
+        );
+    }
+
+    #[test]
+    fn placeholder_only_quota_snapshots_are_not_authoritative() {
+        assert_no_usable_quota_is_unavailable(
+            "implicit placeholder",
+            r#"{
+                "copilot_plan": "pro",
+                "quota_snapshots": {
+                    "premium_interactions": {
+                        "entitlement": 0,
+                        "remaining": 0,
+                        "percent_remaining": 0,
+                        "quota_id": ""
+                    }
+                }
+            }"#,
+        );
+    }
+
+    #[test]
+    fn explicit_placeholder_quota_snapshot_is_not_authoritative() {
+        assert_no_usable_quota_is_unavailable(
+            "explicit placeholder",
+            r#"{
+                "copilot_plan": "pro",
+                "quota_snapshots": {
+                    "premium_interactions": {
+                        "entitlement": 300,
+                        "remaining": 240,
+                        "percent_remaining": 80,
+                        "quota_id": "premium_interactions",
+                        "placeholder": true
+                    }
+                }
+            }"#,
+        );
+    }
+
+    #[test]
+    fn malformed_quota_snapshot_entries_are_not_authoritative() {
+        // Non-object entries fail per-entry decoding and are skipped; the
+        // parser degrades to "no quota" instead of erroring, so the primary
+        // must degrade with it.
+        assert_no_usable_quota_is_unavailable(
+            "malformed entries",
+            r#"{
+                "copilot_plan": "pro",
+                "quota_snapshots": {
+                    "premium_interactions": "not-an-object",
+                    "chat": [80, 20],
+                    "completions": 40
+                }
+            }"#,
+        );
+    }
+
+    #[test]
+    fn unsupported_quota_kinds_only_are_not_authoritative() {
+        // An unrecognized kind renders as an extra row, but it is not a
+        // premium/chat/completions lane — the primary stays evidence-free.
+        let usage = parse_snapshot(
+            r#"{
+                "copilot_plan": "pro",
+                "quota_snapshots": {
+                    "additional_budget": {
+                        "entitlement": 100,
+                        "remaining": 40,
+                        "percent_remaining": 40,
+                        "quota_id": "additional_budget"
+                    }
+                }
+            }"#,
+        );
+        assert_eq!(usage.extra_rate_windows.len(), 1);
+        assert_eq!(usage.extra_rate_windows[0].id, "additional-budget");
+
+        assert_no_usable_quota_is_unavailable(
+            "unsupported kinds only",
+            r#"{
+                "copilot_plan": "pro",
+                "quota_snapshots": {
+                    "additional_budget": {
+                        "entitlement": 100,
+                        "remaining": 40,
+                        "percent_remaining": 40,
+                        "quota_id": "additional_budget"
+                    }
+                }
+            }"#,
+        );
+    }
+
+    #[test]
+    fn quota_snapshot_without_usable_amount_is_not_authoritative() {
+        assert_no_usable_quota_is_unavailable(
+            "no usable amount",
+            r#"{
+                "copilot_plan": "pro",
+                "quota_snapshots": {
+                    "premium_interactions": {
+                        "quota_id": "premium_interactions"
+                    }
+                }
+            }"#,
+        );
+    }
+
+    #[test]
+    fn usable_quota_next_to_unusable_entries_stays_authoritative() {
+        // Positive control: the fallback must not bleed into responses that do
+        // carry a real quota.
+        let usage = parse_snapshot(
+            r#"{
+                "copilot_plan": "pro",
+                "quota_snapshots": {
+                    "premium_interactions": {
+                        "entitlement": 300,
+                        "remaining": 240,
+                        "percent_remaining": 80,
+                        "quota_id": "premium_interactions"
+                    },
+                    "broken": "not-an-object"
+                }
+            }"#,
+        );
+
+        assert!(usage.primary.quota_authoritative);
+        assert_eq!(usage.primary.trusted_used_percent(), Some(20.0));
+        assert_eq!(
+            guard_remaining_headroom(Some(&usage.primary), RateWindowCadence::Session),
+            Some(80.0)
+        );
     }
 
     #[test]
