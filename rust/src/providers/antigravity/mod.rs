@@ -3,7 +3,9 @@
 //! Fetches usage data from Antigravity's local language server probe
 //! Uses Windows process detection to find CSRF token
 
+mod cli_fallback;
 pub mod local_sessions;
+mod quota_summary;
 
 use async_trait::async_trait;
 use regex_lite::Regex;
@@ -456,7 +458,10 @@ impl AntigravityProvider {
             .and_then(|config| config.quota_info.as_ref())
             .map(rate_window_from_quota);
 
-        let primary = primary.unwrap_or_else(|| RateWindow::new(0.0));
+        // No usable quota config at all: the snapshot still needs a primary
+        // slot, but that `0.0` is structure, not a measurement, so it carries
+        // no authority. The public JSON is unchanged.
+        let primary = primary.unwrap_or_else(|| RateWindow::new(0.0).non_authoritative());
         let mut snapshot = UsageSnapshot::new(primary);
 
         if let Some(sec) = secondary {
@@ -485,13 +490,13 @@ impl AntigravityProvider {
             if title.is_empty() {
                 continue;
             }
+            // `usage_known` tracks the same evidence the window's authority
+            // does, so a rejected fraction is never presented as a known 0%.
+            let window = rate_window_from_quota(quota);
+            let usage_known = window.trusted_used_percent().is_some();
             snapshot.extra_rate_windows.push(
-                NamedRateWindow::new(
-                    model_window_id(config),
-                    title,
-                    rate_window_from_quota(quota),
-                )
-                .with_usage_known(quota.remaining_fraction.is_some()),
+                NamedRateWindow::new(model_window_id(config), title, window)
+                    .with_usage_known(usage_known),
             );
         }
 
@@ -537,26 +542,12 @@ impl Provider for AntigravityProvider {
 
         tracing::debug!("Fetching Antigravity usage via local probe");
 
-        match self.fetch_user_status().await {
-            Ok(usage) => Ok(ProviderFetchResult::new(usage, "local")),
-            Err(e) => {
-                let count = local_sessions::offline_conversation_count();
-                if count > 0 {
-                    let noun = if count == 1 {
-                        "conversation"
-                    } else {
-                        "conversations"
-                    };
-                    let usage = UsageSnapshot::new(RateWindow::informational(format!(
-                        "Offline · {count} {noun}"
-                    )))
-                    .with_login_method("offline");
-                    return Ok(ProviderFetchResult::new(usage, "offline"));
-                }
-                tracing::warn!("Antigravity probe failed: {}", e);
-                Err(e)
-            }
-        }
+        resolve_fetch_result(
+            self.fetch_user_status().await,
+            || cli_fallback::try_fetch(cli_fallback::locate_agy_binary()),
+            local_sessions::offline_conversation_count,
+        )
+        .await
     }
 
     fn available_sources(&self) -> Vec<SourceMode> {
@@ -566,6 +557,69 @@ impl Provider for AntigravityProvider {
     fn supports_cli(&self) -> bool {
         true
     }
+}
+
+/// Pick a result from the ordered Antigravity sources.
+///
+/// Order, each attempted at most once per fetch: the local language-server
+/// probe, then the signed-in `agy` CLI's structured `/usage` report, then
+/// offline conversation history. The probe's own error is preserved for the
+/// caller when no source yields live quota, so an actionable `AuthRequired` is
+/// never traded for silence.
+///
+/// A local snapshot only ends the search when it actually carries a lane with
+/// trusted quota. A syntactically valid response that reports no usable quota
+/// evidence must not suppress the CLI report — otherwise absent evidence would
+/// stand in for a healthy local reading. Such a snapshot is still returned as a
+/// last resort, after the CLI report, with its lanes non-authoritative.
+///
+/// `cli_report` is a closure so binary discovery only runs when the local probe
+/// failed to produce trusted quota.
+async fn resolve_fetch_result<F, Fut>(
+    local: Result<UsageSnapshot, ProviderError>,
+    cli_report: F,
+    offline_conversation_count: impl FnOnce() -> usize,
+) -> Result<ProviderFetchResult, ProviderError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Option<ProviderFetchResult>>,
+{
+    let local = match local {
+        Ok(usage) if has_trusted_live_quota(&usage) => {
+            return Ok(ProviderFetchResult::new(usage, "local"));
+        }
+        other => other,
+    };
+
+    if let Some(result) = cli_report().await {
+        tracing::debug!("Antigravity usage served by the structured agy CLI report");
+        return Ok(result);
+    }
+
+    let error = match local {
+        Ok(usage) => {
+            tracing::debug!("Antigravity local probe returned no trusted quota lane");
+            return Ok(ProviderFetchResult::new(usage, "local"));
+        }
+        Err(error) => error,
+    };
+
+    let count = offline_conversation_count();
+    if count > 0 {
+        let noun = if count == 1 {
+            "conversation"
+        } else {
+            "conversations"
+        };
+        let usage = UsageSnapshot::new(RateWindow::informational(format!(
+            "Offline · {count} {noun}"
+        )))
+        .with_login_method("offline");
+        return Ok(ProviderFetchResult::new(usage, "offline"));
+    }
+
+    tracing::warn!("Antigravity probe failed: {}", error);
+    Err(error)
 }
 
 struct ProcessInfo {
@@ -800,10 +854,48 @@ fn model_window_id(config: &ModelConfig) -> String {
     format!("model-{}", if slug.is_empty() { "unknown" } else { &slug })
 }
 
+/// Turn one local-probe quota bucket into a rate window.
+///
+/// Authority is decided from the *raw* `remainingFraction` before any
+/// normalization, by the same rule the structured CLI parser applies
+/// ([`quota_summary::authoritative_used_percent`]). A missing, null,
+/// non-finite, or out-of-range fraction is absent evidence: the window keeps a
+/// `0.0` display placeholder but drops quota authority, so missing evidence can
+/// never read as "0% used / 100% remaining". An explicit `0.0` is a real
+/// measurement and stays authoritative at 100% used.
 fn rate_window_from_quota(quota: &QuotaInfo) -> RateWindow {
-    let remaining = quota.remaining_fraction.unwrap_or(1.0);
-    let used_percent = (1.0 - remaining) * 100.0;
-    RateWindow::with_details(used_percent, None, None, quota.reset_time.clone())
+    let used_percent = quota_summary::authoritative_used_percent(quota.remaining_fraction);
+    RateWindow::with_details(
+        used_percent.unwrap_or(0.0),
+        None,
+        None,
+        quota.reset_time.clone(),
+    )
+    .with_quota_authority(used_percent.is_some())
+}
+
+/// Whether a snapshot carries at least one lane backed by trusted live quota.
+///
+/// This is the security decision behind "the local probe answered": it consults
+/// [`RateWindow::trusted_used_percent`], never the presentation-only
+/// `usage_known` flag, so informational placeholders and windows whose evidence
+/// was rejected do not count as a live reading.
+fn has_trusted_live_quota(snapshot: &UsageSnapshot) -> bool {
+    [
+        Some(&snapshot.primary),
+        snapshot.secondary.as_ref(),
+        snapshot.model_specific.as_ref(),
+        snapshot.tertiary.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .chain(
+        snapshot
+            .extra_rate_windows
+            .iter()
+            .map(|named| &named.window),
+    )
+    .any(|window| window.trusted_used_percent().is_some())
 }
 
 fn clean_model_label(label: &str) -> String {
