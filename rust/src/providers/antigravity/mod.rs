@@ -3,7 +3,9 @@
 //! Fetches usage data from Antigravity's local language server probe
 //! Uses Windows process detection to find CSRF token
 
+mod cli_fallback;
 pub mod local_sessions;
+mod quota_summary;
 
 use async_trait::async_trait;
 use regex_lite::Regex;
@@ -537,9 +539,21 @@ impl Provider for AntigravityProvider {
 
         tracing::debug!("Fetching Antigravity usage via local probe");
 
+        // Source order, each attempted at most once per fetch: the local
+        // language-server probe, then the signed-in `agy` CLI's structured
+        // `/usage` report, then offline conversation history. The probe's own
+        // error is preserved for the caller when no source yields live quota,
+        // so an actionable `AuthRequired` is never traded for silence.
         match self.fetch_user_status().await {
             Ok(usage) => Ok(ProviderFetchResult::new(usage, "local")),
             Err(e) => {
+                if let Some(result) =
+                    cli_fallback::try_fetch(cli_fallback::locate_agy_binary()).await
+                {
+                    tracing::debug!("Antigravity usage served by the structured agy CLI report");
+                    return Ok(result);
+                }
+
                 let count = local_sessions::offline_conversation_count();
                 if count > 0 {
                     let noun = if count == 1 {
