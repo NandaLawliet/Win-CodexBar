@@ -135,7 +135,10 @@ pub(super) fn parse_cli_usage_report(data: &[u8]) -> Result<UsageSnapshot, Provi
 /// `[0.0, 1.0]`. Out-of-range and non-finite fractions return `None` rather
 /// than being clamped into a plausible-looking percentage, so a malformed
 /// reading can never be laundered into "0% used".
-fn authoritative_used_percent(remaining_fraction: Option<f64>) -> Option<f64> {
+///
+/// Shared with the local language-server probe (`super::rate_window_from_quota`)
+/// so both Antigravity quota sources decide authority by the same rule.
+pub(super) fn authoritative_used_percent(remaining_fraction: Option<f64>) -> Option<f64> {
     let fraction = remaining_fraction?;
     if !fraction.is_finite() || !(0.0..=1.0).contains(&fraction) {
         return None;

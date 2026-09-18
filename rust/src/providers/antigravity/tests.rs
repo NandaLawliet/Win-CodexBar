@@ -1,4 +1,5 @@
 use super::*;
+use crate::core::RateWindowCadence;
 
 #[test]
 fn test_classify_model_families() {
@@ -378,4 +379,380 @@ fn models_in_distinct_quota_buckets_keep_separate_lanes() {
     let provider = AntigravityProvider::new();
     let snap = provider.parse_user_status(resp).unwrap();
     assert_eq!(snap.extra_rate_windows.len(), 3);
+}
+
+// ── Local-probe quota authority ───────────────────────────────────────────
+//
+// Invariant under test: missing, null, or invalid `remainingFraction` evidence
+// must move a lane toward unavailable, never toward a favorable "0% used /
+// 100% remaining" authoritative reading. An explicit raw `0.0` is a real
+// measurement and must stay authoritative at 100% used.
+
+/// Parse a single model config whose `quotaInfo` is the given JSON literal.
+fn parse_single_quota(quota_info: serde_json::Value) -> UsageSnapshot {
+    let json = serde_json::json!({
+        "userStatus": {
+            "cascadeModelConfigData": {
+                "clientModelConfigs": [
+                    {"label": "Claude 4 Sonnet", "quotaInfo": quota_info}
+                ]
+            }
+        }
+    });
+    let response: UserStatusResponse = serde_json::from_value(json).expect("fixture parses");
+    AntigravityProvider::new()
+        .parse_user_status(response)
+        .expect("snapshot")
+}
+
+#[test]
+fn local_remaining_one_is_trusted_zero_percent_used() {
+    let snapshot = parse_single_quota(serde_json::json!({"remainingFraction": 1.0}));
+
+    assert_eq!(snapshot.primary.trusted_used_percent(), Some(0.0));
+    assert!(has_trusted_live_quota(&snapshot));
+}
+
+#[test]
+fn local_explicit_zero_remaining_is_trusted_hundred_percent_used() {
+    // The security-critical distinction: an explicit raw 0.0 is exhausted
+    // quota, not missing evidence.
+    let snapshot = parse_single_quota(serde_json::json!({"remainingFraction": 0.0}));
+
+    assert_eq!(snapshot.primary.trusted_used_percent(), Some(100.0));
+    assert!(snapshot.primary.quota_authoritative);
+    assert!(has_trusted_live_quota(&snapshot));
+    assert!(snapshot.extra_rate_windows[0].usage_known);
+}
+
+#[test]
+fn local_fractional_remaining_is_trusted() {
+    let snapshot = parse_single_quota(serde_json::json!({"remainingFraction": 0.31}));
+
+    let used = snapshot.primary.trusted_used_percent().expect("trusted");
+    assert!((used - 69.0).abs() < 0.001, "0.31 remaining → 69% used");
+}
+
+#[test]
+fn local_missing_remaining_fraction_is_not_authoritative() {
+    // `{"quotaInfo": {}}` deserializes cleanly because the field is optional.
+    let snapshot = parse_single_quota(serde_json::json!({}));
+
+    assert_eq!(snapshot.primary.trusted_used_percent(), None);
+    assert!(!snapshot.primary.quota_authoritative);
+    assert!(!has_trusted_live_quota(&snapshot));
+}
+
+#[test]
+fn local_reset_time_without_remaining_fraction_is_not_authoritative() {
+    let snapshot = parse_single_quota(serde_json::json!({"resetTime": "2026-01-01T00:00:00Z"}));
+
+    assert_eq!(snapshot.primary.trusted_used_percent(), None);
+    assert!(!has_trusted_live_quota(&snapshot));
+}
+
+#[test]
+fn local_null_remaining_fraction_is_not_authoritative() {
+    let snapshot = parse_single_quota(serde_json::json!({"remainingFraction": null}));
+
+    assert_eq!(snapshot.primary.trusted_used_percent(), None);
+    assert!(!has_trusted_live_quota(&snapshot));
+    assert!(!snapshot.extra_rate_windows[0].usage_known);
+}
+
+#[test]
+fn local_out_of_range_remaining_fraction_is_not_authoritative() {
+    for fraction in [-0.1_f64, 1.1_f64, -1.0_f64, 2.0_f64] {
+        let snapshot = parse_single_quota(serde_json::json!({"remainingFraction": fraction}));
+
+        assert_eq!(
+            snapshot.primary.trusted_used_percent(),
+            None,
+            "{fraction} is out of range and must not be laundered into authority"
+        );
+        assert!(!has_trusted_live_quota(&snapshot));
+        assert!(!snapshot.extra_rate_windows[0].usage_known);
+    }
+}
+
+#[test]
+fn local_nonfinite_remaining_fraction_is_not_authoritative() {
+    // JSON cannot carry NaN/±Infinity, but the struct can be built in-process,
+    // so the authority gate must reject them at the source.
+    for fraction in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let quota = QuotaInfo {
+            remaining_fraction: Some(fraction),
+            reset_time: None,
+        };
+        let window = rate_window_from_quota(&quota);
+
+        assert!(
+            !window.quota_authoritative,
+            "{fraction} must not be trusted"
+        );
+        assert_eq!(window.trusted_used_percent(), None);
+        assert!(
+            window.used_percent.is_finite(),
+            "a non-finite percent must never be stored"
+        );
+    }
+}
+
+#[test]
+fn empty_client_model_configs_yields_no_authoritative_primary() {
+    let json = serde_json::json!({
+        "userStatus": {"cascadeModelConfigData": {"clientModelConfigs": []}}
+    });
+    let response: UserStatusResponse = serde_json::from_value(json).expect("fixture parses");
+    let snapshot = AntigravityProvider::new()
+        .parse_user_status(response)
+        .expect("snapshot");
+
+    assert_eq!(snapshot.primary.used_percent, 0.0);
+    assert!(
+        !snapshot.primary.quota_authoritative,
+        "an empty model-config list is absent evidence, not a healthy quota"
+    );
+    assert_eq!(snapshot.primary.trusted_used_percent(), None);
+    assert!(!has_trusted_live_quota(&snapshot));
+}
+
+#[test]
+fn quota_configs_without_usable_values_yield_no_trusted_summary_lane() {
+    let json = serde_json::json!({
+        "userStatus": {
+            "cascadeModelConfigData": {
+                "clientModelConfigs": [
+                    {"label": "Claude 4 Sonnet", "quotaInfo": {}},
+                    {"label": "Gemini 2.5 Pro Low", "quotaInfo": {"remainingFraction": null}},
+                    {"label": "Gemini 2.5 Flash", "quotaInfo": {"remainingFraction": 1.5}}
+                ]
+            }
+        }
+    });
+    let response: UserStatusResponse = serde_json::from_value(json).expect("fixture parses");
+    let snapshot = AntigravityProvider::new()
+        .parse_user_status(response)
+        .expect("snapshot");
+
+    assert_eq!(snapshot.primary.trusted_used_percent(), None);
+    assert_eq!(
+        snapshot
+            .secondary
+            .as_ref()
+            .and_then(|window| window.trusted_used_percent()),
+        None
+    );
+    assert_eq!(
+        snapshot
+            .model_specific
+            .as_ref()
+            .and_then(|window| window.trusted_used_percent()),
+        None
+    );
+    assert!(
+        !has_trusted_live_quota(&snapshot),
+        "no bucket carried usable evidence, so no lane may claim live quota"
+    );
+}
+
+#[test]
+fn informational_placeholder_is_not_trusted_live_quota() {
+    let snapshot = UsageSnapshot::new(RateWindow::no_active_session());
+    assert!(!has_trusted_live_quota(&snapshot));
+
+    let snapshot = UsageSnapshot::new(RateWindow::informational("Offline · 3 conversations"));
+    assert!(!has_trusted_live_quota(&snapshot));
+}
+
+#[test]
+fn trusted_live_quota_is_detected_in_every_snapshot_slot() {
+    let trusted = || RateWindow::new(42.0);
+    assert!(has_trusted_live_quota(&UsageSnapshot::new(trusted())));
+
+    let untrusted = || RateWindow::new(0.0).non_authoritative();
+    assert!(has_trusted_live_quota(
+        &UsageSnapshot::new(untrusted()).with_secondary(trusted())
+    ));
+    assert!(has_trusted_live_quota(
+        &UsageSnapshot::new(untrusted()).with_model_specific(trusted())
+    ));
+    assert!(has_trusted_live_quota(
+        &UsageSnapshot::new(untrusted()).with_tertiary(trusted())
+    ));
+    assert!(has_trusted_live_quota(
+        &UsageSnapshot::new(untrusted()).with_extra_rate_window("x", "X", trusted())
+    ));
+    assert!(!has_trusted_live_quota(
+        &UsageSnapshot::new(untrusted()).with_extra_rate_window("x", "X", untrusted())
+    ));
+}
+
+// ── Source resolution order ───────────────────────────────────────────────
+
+/// Sanitized structured `agy /usage` report, matching the real host's shape.
+const CLI_REPORT: &[u8] = br#"{
+  "status": "SUCCESS",
+  "command": {
+    "name": "usage",
+    "data": {
+      "groups": [
+        {
+          "name": "Gemini Models",
+          "buckets": [
+            {"id": "gemini-weekly", "window": "weekly", "remaining_fraction": 0.85},
+            {"id": "gemini-5h", "window": "5h", "remaining_fraction": 0.31}
+          ]
+        }
+      ]
+    }
+  }
+}"#;
+
+fn cli_result() -> ProviderFetchResult {
+    let usage = quota_summary::parse_cli_usage_report(CLI_REPORT).expect("CLI report parses");
+    ProviderFetchResult::new(usage, "cli")
+}
+
+fn local_snapshot(fraction: Option<f64>) -> UsageSnapshot {
+    let quota = match fraction {
+        Some(value) => serde_json::json!({"remainingFraction": value}),
+        None => serde_json::json!({}),
+    };
+    parse_single_quota(quota)
+}
+
+#[tokio::test]
+async fn local_snapshot_without_trusted_quota_falls_through_to_the_cli_report() {
+    let result = resolve_fetch_result(
+        Ok(local_snapshot(None)),
+        || async { Some(cli_result()) },
+        || panic!("offline history must not be consulted once the CLI answered"),
+    )
+    .await
+    .expect("CLI report resolves the fetch");
+
+    assert_eq!(result.source_label, "cli");
+    // The promoted lanes come from the CLI data, not the local placeholder.
+    assert_eq!(
+        result
+            .usage
+            .primary
+            .authoritative_used_percent(RateWindowCadence::Session)
+            .map(|used| (used * 1000.0).round() / 1000.0),
+        Some(69.0)
+    );
+    assert_eq!(
+        result
+            .usage
+            .secondary
+            .as_ref()
+            .and_then(|window| window.authoritative_used_percent(RateWindowCadence::Weekly))
+            .map(|used| (used * 1000.0).round() / 1000.0),
+        Some(15.0)
+    );
+}
+
+#[tokio::test]
+async fn local_snapshot_with_trusted_quota_wins_over_the_cli_report() {
+    let result = resolve_fetch_result(
+        Ok(local_snapshot(Some(0.8))),
+        || async { panic!("a trusted local lane must not trigger the CLI fallback") },
+        || panic!("offline history must not be consulted"),
+    )
+    .await
+    .expect("local probe resolves the fetch");
+
+    assert_eq!(result.source_label, "local");
+    let used = result
+        .usage
+        .primary
+        .trusted_used_percent()
+        .expect("trusted local lane");
+    assert!((used - 20.0).abs() < 0.001);
+}
+
+#[tokio::test]
+async fn local_exhausted_zero_still_counts_as_trusted_local_quota() {
+    let result = resolve_fetch_result(
+        Ok(local_snapshot(Some(0.0))),
+        || async { panic!("exhausted quota is evidence, not absence") },
+        || panic!("offline history must not be consulted"),
+    )
+    .await
+    .expect("local probe resolves the fetch");
+
+    assert_eq!(result.source_label, "local");
+    assert_eq!(result.usage.primary.trusted_used_percent(), Some(100.0));
+}
+
+#[tokio::test]
+async fn untrusted_local_snapshot_is_the_last_resort_when_the_cli_is_unavailable() {
+    let result = resolve_fetch_result(Ok(local_snapshot(None)), || async { None }, || 0)
+        .await
+        .expect("the untrusted local snapshot is still returned");
+
+    assert_eq!(result.source_label, "local");
+    assert_eq!(
+        result.usage.primary.trusted_used_percent(),
+        None,
+        "it is returned for display only — it never regains authority"
+    );
+}
+
+#[tokio::test]
+async fn offline_history_answers_when_the_probe_and_the_cli_both_fail() {
+    let result = resolve_fetch_result(
+        Err(ProviderError::Other("probe failed".into())),
+        || async { None },
+        || 3,
+    )
+    .await
+    .expect("offline history resolves the fetch");
+
+    assert_eq!(result.source_label, "offline");
+    assert_eq!(result.usage.login_method.as_deref(), Some("offline"));
+    assert_eq!(
+        result.usage.primary.reset_description.as_deref(),
+        Some("Offline · 3 conversations")
+    );
+    assert!(result.usage.primary.is_informational);
+    assert_eq!(result.usage.primary.trusted_used_percent(), None);
+}
+
+#[tokio::test]
+async fn auth_required_survives_when_no_source_yields_live_quota() {
+    let error = resolve_fetch_result(Err(ProviderError::AuthRequired), || async { None }, || 0)
+        .await
+        .expect_err("the actionable probe error is preserved");
+
+    assert!(matches!(error, ProviderError::AuthRequired));
+}
+
+#[tokio::test]
+async fn offline_history_outranks_an_actionable_probe_error() {
+    // Existing intended order: offline history is preferred over surfacing the
+    // probe error, and only an empty history lets `AuthRequired` through.
+    let result = resolve_fetch_result(Err(ProviderError::AuthRequired), || async { None }, || 1)
+        .await
+        .expect("offline history resolves the fetch");
+
+    assert_eq!(result.source_label, "offline");
+    assert_eq!(
+        result.usage.primary.reset_description.as_deref(),
+        Some("Offline · 1 conversation")
+    );
+}
+
+#[tokio::test]
+async fn a_failed_probe_still_reaches_the_cli_report() {
+    let result = resolve_fetch_result(
+        Err(ProviderError::AuthRequired),
+        || async { Some(cli_result()) },
+        || panic!("offline history must not be consulted once the CLI answered"),
+    )
+    .await
+    .expect("CLI report resolves the fetch");
+
+    assert_eq!(result.source_label, "cli");
 }
