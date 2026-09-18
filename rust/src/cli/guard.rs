@@ -12,7 +12,9 @@ use tokio::time::{Duration, timeout};
 
 use super::exit_codes;
 use super::usage::ProviderSelection;
-use crate::core::{FetchContext, ProviderId, RateWindow, SourceMode, instantiate_provider};
+use crate::core::{
+    FetchContext, ProviderId, RateWindow, RateWindowCadence, SourceMode, instantiate_provider,
+};
 
 /// Arguments for `codexbar guard`.
 #[derive(Args, Debug, Clone)]
@@ -70,6 +72,18 @@ impl GuardWindow {
             "session" => Some(GuardWindow::Session),
             "weekly" => Some(GuardWindow::Weekly),
             _ => None,
+        }
+    }
+
+    /// Cadence this guard window must match when the provider declares one.
+    ///
+    /// `Weekly` keeps the repository-wide `10080 ≤ minutes < 43200`
+    /// classification from [`RateWindowCadence::from_minutes`]; it is not an
+    /// equality check against 10080.
+    pub fn cadence(self) -> RateWindowCadence {
+        match self {
+            GuardWindow::Session => RateWindowCadence::Session,
+            GuardWindow::Weekly => RateWindowCadence::Weekly,
         }
     }
 }
@@ -169,13 +183,30 @@ pub fn evaluate_guard(
 }
 
 /// Remaining headroom (`100 - used_percent`) for a rate window, or `None` when
-/// the window is absent or informational (not a real quota lane).
-pub fn guard_remaining_headroom(window: Option<&RateWindow>) -> Option<f64> {
+/// the window cannot back an authoritative quota decision.
+///
+/// Authority comes from the shared fail-closed accessors on [`RateWindow`], so
+/// an absent, informational, fabricated, non-finite, or out-of-range window
+/// reports unavailable instead of appearing healthy.
+///
+/// Guard selects windows by snapshot slot (primary / secondary), not by
+/// declared duration, and many providers report a genuine quota without a
+/// `window_minutes` value. So the cadence gate applies only when the provider
+/// actually declares one: a declared duration must match `expected`
+/// ([`RateWindow::authoritative_used_percent`]), while an undeclared duration
+/// keeps the historical slot-based contract but still passes every other
+/// authority gate ([`RateWindow::trusted_used_percent`]).
+pub fn guard_remaining_headroom(
+    window: Option<&RateWindow>,
+    expected: RateWindowCadence,
+) -> Option<f64> {
     let window = window?;
-    if window.is_informational {
-        return None;
-    }
-    Some(100.0 - window.used_percent)
+    let used_percent = if window.window_minutes.is_some() {
+        window.authoritative_used_percent(expected)?
+    } else {
+        window.trusted_used_percent()?
+    };
+    Some(100.0 - used_percent)
 }
 
 /// Validate `--min-remaining` (finite percent in `0…100`).
@@ -325,7 +356,7 @@ async fn fetch_guard_outcome(
                 GuardWindow::Session => Some(&result.usage.primary),
                 GuardWindow::Weekly => result.usage.secondary.as_ref(),
             };
-            match guard_remaining_headroom(rate_window) {
+            match guard_remaining_headroom(rate_window, window.cadence()) {
                 Some(remaining) => GuardFetchOutcome::Available(remaining),
                 None => GuardFetchOutcome::Unavailable(GuardUnavailableReason::WindowUnavailable),
             }
@@ -474,25 +505,34 @@ mod tests {
     #[test]
     fn real_window_reports_remaining_headroom() {
         let window = RateWindow::new(30.0);
-        let remaining = guard_remaining_headroom(Some(&window));
+        let remaining = guard_remaining_headroom(Some(&window), RateWindowCadence::Session);
         assert_eq!(remaining, Some(70.0));
     }
 
     #[test]
     fn informational_window_is_treated_as_unknown() {
         let window = RateWindow::informational("no session");
-        assert_eq!(guard_remaining_headroom(Some(&window)), None);
+        assert_eq!(
+            guard_remaining_headroom(Some(&window), RateWindowCadence::Session),
+            None
+        );
     }
 
     #[test]
     fn absent_window_is_unknown() {
-        assert_eq!(guard_remaining_headroom(None), None);
+        assert_eq!(
+            guard_remaining_headroom(None, RateWindowCadence::Session),
+            None
+        );
     }
 
     #[test]
     fn fully_used_real_window_has_zero_headroom() {
         let window = RateWindow::new(100.0);
-        assert_eq!(guard_remaining_headroom(Some(&window)), Some(0.0));
+        assert_eq!(
+            guard_remaining_headroom(Some(&window), RateWindowCadence::Session),
+            Some(0.0)
+        );
     }
 
     #[test]
@@ -570,6 +610,136 @@ mod tests {
             line,
             "codex weekly: unknown — UNKNOWN (minimum 10%; timeout)"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Quota-authority regressions.
+    //
+    // Established valid behavior and the exit-code contract are unchanged;
+    // newly identified unauthoritative quota fails unavailable instead of
+    // reading as healthy headroom.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn declared_session_window_keeps_its_headroom() {
+        let window = RateWindow::with_details(30.0, Some(300), None, None);
+        assert_eq!(
+            guard_remaining_headroom(Some(&window), RateWindowCadence::Session),
+            Some(70.0)
+        );
+        let evaluation = evaluate_guard(GuardFetchOutcome::Available(70.0), 10.0, false);
+        assert_eq!(evaluation.decision, GuardDecision::Ok);
+        assert_eq!(evaluation.exit_code, exit_codes::SUCCESS);
+    }
+
+    #[test]
+    fn declared_weekly_windows_keep_their_headroom() {
+        for minutes in [10_080_u32, 20_160] {
+            let window = RateWindow::with_details(30.0, Some(minutes), None, None);
+            assert_eq!(
+                guard_remaining_headroom(Some(&window), RateWindowCadence::Weekly),
+                Some(70.0),
+                "{minutes} minutes must classify as weekly authority"
+            );
+        }
+    }
+
+    #[test]
+    fn declared_cadence_mismatch_fails_closed() {
+        let weekly = RateWindow::with_details(30.0, Some(10_080), None, None);
+        assert_eq!(
+            guard_remaining_headroom(Some(&weekly), RateWindowCadence::Session),
+            None
+        );
+
+        let monthly = RateWindow::with_details(30.0, Some(43_200), None, None);
+        assert_eq!(
+            guard_remaining_headroom(Some(&monthly), RateWindowCadence::Weekly),
+            None,
+            "43200 minutes is monthly, not weekly"
+        );
+    }
+
+    #[test]
+    fn fabricated_zero_percent_quota_is_no_longer_full_headroom() {
+        // Before hardening this returned Some(100.0) — a fabricated "healthy"
+        // verdict for a quota the provider never reported.
+        let window = RateWindow::with_details(0.0, Some(300), None, None).non_authoritative();
+        assert_eq!(
+            guard_remaining_headroom(Some(&window), RateWindowCadence::Session),
+            None
+        );
+
+        let evaluation = evaluate_guard(
+            GuardFetchOutcome::Unavailable(GuardUnavailableReason::WindowUnavailable),
+            10.0,
+            false,
+        );
+        assert_eq!(evaluation.decision, GuardDecision::Unknown);
+        assert_eq!(evaluation.exit_code, exit_codes::UNAVAILABLE);
+    }
+
+    #[test]
+    fn non_finite_quota_is_unavailable_not_healthy() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let window = RateWindow::with_details(value, Some(300), None, None);
+            assert_eq!(
+                guard_remaining_headroom(Some(&window), RateWindowCadence::Session),
+                None,
+                "{value} must not read as 100% remaining"
+            );
+        }
+    }
+
+    #[test]
+    fn out_of_range_quota_is_unavailable_not_healthy() {
+        for value in [-0.1_f64, 100.1] {
+            let window = RateWindow::with_details(value, Some(300), None, None);
+            assert_eq!(
+                guard_remaining_headroom(Some(&window), RateWindowCadence::Session),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn undeclared_cadence_keeps_the_historical_slot_contract() {
+        // Many providers report a genuine quota with no window_minutes; guard
+        // selects by slot, so those must keep working.
+        let valid = RateWindow::new(30.0);
+        assert_eq!(
+            guard_remaining_headroom(Some(&valid), RateWindowCadence::Session),
+            Some(70.0)
+        );
+        assert_eq!(
+            guard_remaining_headroom(Some(&valid), RateWindowCadence::Weekly),
+            Some(70.0)
+        );
+
+        // …but every non-cadence authority gate still applies.
+        let fabricated = RateWindow::new(0.0).non_authoritative();
+        assert_eq!(
+            guard_remaining_headroom(Some(&fabricated), RateWindowCadence::Session),
+            None
+        );
+    }
+
+    #[test]
+    fn deserialized_quota_is_unavailable_to_guard() {
+        let json = serde_json::to_string(&RateWindow::with_details(30.0, Some(300), None, None))
+            .expect("serialize");
+        let restored: RateWindow = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            guard_remaining_headroom(Some(&restored), RateWindowCadence::Session),
+            None,
+            "authority must not survive a JSON round trip into a guard decision"
+        );
+    }
+
+    #[test]
+    fn guard_window_cadence_mapping() {
+        assert_eq!(GuardWindow::Session.cadence(), RateWindowCadence::Session);
+        assert_eq!(GuardWindow::Weekly.cadence(), RateWindowCadence::Weekly);
     }
 
     #[tokio::test]

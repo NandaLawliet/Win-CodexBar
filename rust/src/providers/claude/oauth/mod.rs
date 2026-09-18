@@ -530,7 +530,8 @@ impl ClaudeOAuthFetcher {
                     .as_ref()
                     .and_then(|w| Self::to_rate_window(w, Some(300)))
             })
-            .unwrap_or_else(|| RateWindow::new(0.0));
+            // No session lane at all: the 0.0 is a placeholder, not a reading.
+            .unwrap_or_else(|| RateWindow::new(0.0).non_authoritative());
 
         let mut usage = UsageSnapshot::new(primary);
 
