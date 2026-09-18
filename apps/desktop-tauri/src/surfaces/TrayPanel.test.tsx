@@ -724,7 +724,8 @@ describe("TrayPanel provider grid", () => {
       (el) => el.textContent?.includes("Refresh"),
     );
     expect(zoomIndex).toBeGreaterThanOrEqual(0);
-    expect(refreshIndex).toBeGreaterThan(zoomIndex);
+    expect(refreshIndex).toBe(-1);
+    expect(screen.getByRole("button", { name: /Refresh/ })).toBeVisible();
 
     // Slider reflects the persisted settings value.
     const slider = container.querySelector<HTMLInputElement>(
@@ -930,15 +931,16 @@ describe("TrayPanel provider grid", () => {
       } finally { write.mockRestore(); }
   });
 
-  it("defaults all optional footer items visible and keeps Refresh final", async () => {
+  it("defaults all optional footer items visible and places Refresh All at the top", async () => {
     const { container } = renderTrayPanel([]);
     expect(await screen.findByRole("slider", { name: "Zoom" })).toBeVisible();
     for (const label of [/^Settings/, /^About CodexBar/, /^Quit/]) {
       expect(screen.getByRole("button", { name: label })).toBeVisible();
     }
+    expect(screen.getByRole("button", { name: /Refresh/ })).toBeVisible();
     const footer = container.querySelector(".menu-surface__footer")!;
-    expect(footer.lastElementChild?.textContent).toContain("Refresh");
-    expect(footer.lastElementChild?.textContent).toContain("Ctrl+R");
+    expect(footer.textContent).not.toContain("Refresh");
+    expect(footer.lastElementChild?.textContent).toContain("Quit");
     expect(screen.getByRole("button", { name: "Edit footer visibility" })).toBeVisible();
   });
 
@@ -969,7 +971,7 @@ describe("TrayPanel provider grid", () => {
     fireEvent.click(restoredEditor);
     expect(screen.getByRole("slider", { name: "Zoom" })).toBeVisible();
     expect(screen.getByRole("button", { name: /Quit/ })).toBeVisible();
-    expect(second.container.querySelector(".menu-surface__footer")?.lastElementChild?.textContent).toContain("Refresh");
+    expect(second.container.querySelector(".menu-surface__footer")?.lastElementChild?.textContent).toContain("Quit");
   });
 
   it.each(["not-json", "null", "[]", '"text"', '{"zoom":"false","quit":0,"unknown":false,"refresh":false,"editor":false}'])
@@ -1002,6 +1004,144 @@ describe("TrayPanel provider grid", () => {
     expect(screen.getByRole("button", { name: "Show Zoom" })).toBeVisible();
     fireEvent.click(screen.getByRole("button", { name: "Show Zoom" }));
     expect(screen.getByRole("slider", { name: "Zoom" })).toBeVisible();
+  });
+
+  it("renders Antigravity with four lanes in default vertical layout", async () => {
+    const antigravity: ProviderUsageSnapshot = {
+      providerId: "antigravity",
+      displayName: "Antigravity",
+      primary: {
+        ...rateWindow(12),
+        windowMinutes: 300,
+        resetDescription: "resets in 4h",
+      },
+      selectedMetric: rateWindow(12),
+      primaryLabel: "Gemini (5h)",
+      secondary: null,
+      modelSpecific: null,
+      tertiary: null,
+      extraRateWindows: [
+        {
+          id: "gemini_weekly",
+          title: "Gemini (weekly)",
+          window: {
+            ...rateWindow(24),
+            windowMinutes: 10080,
+            resetDescription: "resets in 6d",
+          },
+        },
+        {
+          id: "claude_gpt_5h",
+          title: "Claude/GPT (5h)",
+          window: {
+            ...rateWindow(36),
+            windowMinutes: 300,
+            resetDescription: "resets in 3h",
+          },
+        },
+        {
+          id: "claude_gpt_weekly",
+          title: "Claude/GPT (weekly)",
+          window: {
+            ...rateWindow(48),
+            windowMinutes: 10080,
+            resetDescription: "resets in 5d",
+          },
+        },
+      ],
+      cost: null,
+      planName: null,
+      accountEmail: null,
+      sourceLabel: "cli",
+      updatedAt: "2026-05-24T00:00:00Z",
+      error: null,
+      pace: null,
+      accountOrganization: null,
+      trayStatusLabel: null,
+      fetchDurationMs: 42,
+    };
+
+    const { container } = renderTrayPanel([antigravity], { enabledProviders: ["antigravity"] });
+
+    await waitFor(() => {
+      expect(container.querySelector(".menu-card__name")?.textContent).toBe("Antigravity");
+    });
+    expect(screen.getByText("Gemini 5h")).toBeInTheDocument();
+    expect(screen.getByText("Gemini Weekly")).toBeInTheDocument();
+    expect(screen.getByText("Claude/GPT 5h")).toBeInTheDocument();
+    expect(screen.getByText("Claude/GPT Weekly")).toBeInTheDocument();
+
+    expect(container.querySelector(".menu-stack__column")).toBeNull();
+  });
+
+  it("renders Antigravity with four lanes in horizontal wide-column layout", async () => {
+    tauriMocks.flyoutStoredSize.mockResolvedValue([700, 500]);
+
+    const antigravity: ProviderUsageSnapshot = {
+      providerId: "antigravity",
+      displayName: "Antigravity",
+      primary: {
+        ...rateWindow(15),
+        windowMinutes: 300,
+        resetDescription: "resets in 4h",
+      },
+      selectedMetric: rateWindow(15),
+      primaryLabel: "Gemini (5h)",
+      secondary: null,
+      modelSpecific: null,
+      tertiary: null,
+      extraRateWindows: [
+        {
+          id: "gemini_weekly",
+          title: "Gemini (weekly)",
+          window: {
+            ...rateWindow(30),
+            windowMinutes: 10080,
+            resetDescription: "resets in 6d",
+          },
+        },
+        {
+          id: "claude_gpt_5h",
+          title: "Claude/GPT (5h)",
+          window: {
+            ...rateWindow(45),
+            windowMinutes: 300,
+            resetDescription: "resets in 3h",
+          },
+        },
+        {
+          id: "claude_gpt_weekly",
+          title: "Claude/GPT (weekly)",
+          window: {
+            ...rateWindow(60),
+            windowMinutes: 10080,
+            resetDescription: "resets in 5d",
+          },
+        },
+      ],
+      cost: null,
+      planName: null,
+      accountEmail: null,
+      sourceLabel: "cli",
+      updatedAt: "2026-05-24T00:00:00Z",
+      error: null,
+      pace: null,
+      accountOrganization: null,
+      trayStatusLabel: null,
+      fetchDurationMs: 42,
+    };
+
+    const { container } = renderTrayPanel([antigravity], { enabledProviders: ["antigravity"] });
+
+    await waitFor(() => {
+      expect(container.querySelector(".menu-card__name")?.textContent).toBe("Antigravity");
+    });
+    expect(screen.getByText("Gemini 5h")).toBeInTheDocument();
+    expect(screen.getByText("Gemini Weekly")).toBeInTheDocument();
+    expect(screen.getByText("Claude/GPT 5h")).toBeInTheDocument();
+    expect(screen.getByText("Claude/GPT Weekly")).toBeInTheDocument();
+
+    expect(container.querySelector(".menu-stack__column")).toBeInTheDocument();
   });
 
 });

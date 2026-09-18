@@ -58,10 +58,53 @@ export default function MenuSurface({
   children,
 }: MenuSurfaceProps) {
   const { t } = useLocale();
+  const refreshLabel =
+    t("ActionRefreshAll") !== "ActionRefreshAll"
+      ? t("ActionRefreshAll")
+      : t("ActionRefresh") !== "ActionRefresh"
+        ? (t("ActionRefresh") === "Refresh" ? "Refresh All" : t("ActionRefresh"))
+        : "Refresh All";
+
   return (
     <div className={`menu-surface menu-surface--${variant}`} style={style}>
       {titleBar}
       {banner}
+      <div className="menu-surface__top-row">
+        <button
+          type="button"
+          className="menu-surface__refresh-btn"
+          onClick={onRefresh}
+          disabled={isRefreshing}
+          aria-label={refreshLabel}
+          title={refreshLabel}
+          aria-busy={isRefreshing}
+        >
+          <span
+            className={`menu-surface__refresh-icon${isRefreshing ? " spin" : ""}`}
+            aria-hidden
+          >
+            ↻
+          </span>
+          <span>{refreshLabel}</span>
+        </button>
+        {actions && actions.length > 0 && (
+          <div className="menu-surface__actions">
+            {actions.map((action) => (
+              <button
+                key={action.title}
+                type="button"
+                className="menu-surface__btn"
+                onClick={action.onClick}
+                title={action.title}
+                aria-label={action.title}
+              >
+                {action.icon}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+      <h2 className="menu-surface__section-title">Agent Usage</h2>
       {summary}
       <div className="menu-surface__body">{children}</div>
       {(footerLead || (footerRows && footerRows.length > 0)) && (

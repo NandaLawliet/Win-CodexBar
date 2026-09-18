@@ -121,6 +121,104 @@ function displayPlanName(
  * Padding: upstream v0.32.2 uses wider horizontal card padding and slightly
  * taller header/content vertical padding so account/plan rows can breathe.
  */
+/**
+ * Map Antigravity live provider data into four semantic lanes:
+ * 1. Gemini 5h (cadence 300)
+ * 2. Gemini Weekly (cadence 10080)
+ * 3. Claude/GPT 5h (cadence 300)
+ * 4. Claude/GPT Weekly (cadence 10080)
+ *
+ * Uses semantic metadata (titles, IDs, cadence) rather than array indices.
+ * Never fabricates missing lanes. Never reuses legacy labels "Claude" / "Gemini Pro".
+ */
+export function getAntigravityMetrics(provider: ProviderUsageSnapshot): MetricEntry[] {
+  const extras = provider.extraRateWindows ?? [];
+
+  const is5h = (mins: number | null | undefined, title: string, id: string) =>
+    mins === 300 || /\b5h\b|5-hour|session/i.test(title) || /5h|session/i.test(id);
+
+  const isWeekly = (mins: number | null | undefined, title: string, id: string) =>
+    mins === 10080 || /weekly/i.test(title) || /weekly/i.test(id);
+
+  const isGemini = (title: string, id: string) =>
+    /gemini/i.test(title) || /gemini/i.test(id);
+
+  const isClaudeGpt = (title: string, id: string) =>
+    /claude|gpt|third-party/i.test(title) || /claude|gpt|third-party/i.test(id);
+
+  const findExtra = (
+    familyMatch: (title: string, id: string) => boolean,
+    cadenceMatch: (mins: number | null | undefined, title: string, id: string) => boolean,
+  ) => {
+    return extras.find((entry) => {
+      const t = entry.title;
+      const i = entry.id;
+      return familyMatch(t, i) && cadenceMatch(entry.window.windowMinutes, t, i);
+    });
+  };
+
+  const gemini5hExtra = findExtra(isGemini, is5h);
+  const geminiWeeklyExtra = findExtra(isGemini, isWeekly);
+  const claudeGpt5hExtra = findExtra(isClaudeGpt, is5h);
+  const claudeGptWeeklyExtra = findExtra(isClaudeGpt, isWeekly);
+
+  const result: MetricEntry[] = [];
+
+  if (gemini5hExtra) {
+    result.push({
+      id: gemini5hExtra.id,
+      label: "Gemini 5h",
+      snap: gemini5hExtra.window,
+    });
+  } else if (
+    provider.primary &&
+    provider.primary.windowMinutes === 300 &&
+    !/claude/i.test(provider.primaryLabel ?? "")
+  ) {
+    result.push({
+      id: "gemini-5h",
+      label: "Gemini 5h",
+      snap: provider.primary,
+    });
+  }
+
+  if (geminiWeeklyExtra) {
+    result.push({
+      id: geminiWeeklyExtra.id,
+      label: "Gemini Weekly",
+      snap: geminiWeeklyExtra.window,
+    });
+  } else if (
+    provider.secondary &&
+    provider.secondary.windowMinutes === 10080 &&
+    !/gemini pro/i.test(provider.secondaryLabel ?? "")
+  ) {
+    result.push({
+      id: "gemini-weekly",
+      label: "Gemini Weekly",
+      snap: provider.secondary,
+    });
+  }
+
+  if (claudeGpt5hExtra) {
+    result.push({
+      id: claudeGpt5hExtra.id,
+      label: "Claude/GPT 5h",
+      snap: claudeGpt5hExtra.window,
+    });
+  }
+
+  if (claudeGptWeeklyExtra) {
+    result.push({
+      id: claudeGptWeeklyExtra.id,
+      label: "Claude/GPT Weekly",
+      snap: claudeGptWeeklyExtra.window,
+    });
+  }
+
+  return result;
+}
+
 export default function MenuCard({
   provider,
   display,
@@ -223,7 +321,14 @@ export default function MenuCard({
       resetFormatMode: extra.id === "reset-credits" ? "expires" : "reset",
     });
   }
-  const visibleMetrics = compactMetrics ? metrics.slice(0, 2) : metrics;
+
+  const isAntigravity = provider.providerId === "antigravity";
+  const antigravityMetrics = isAntigravity ? getAntigravityMetrics(provider) : [];
+  const visibleMetrics = isAntigravity
+    ? antigravityMetrics
+    : compactMetrics
+      ? metrics.slice(0, 2)
+      : metrics;
 
   const presence = describeCard(
     provider,

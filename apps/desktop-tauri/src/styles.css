@@ -3262,6 +3262,60 @@ body:has(.tray-panel-reveal) {
    (refresh / settings / pop-out). Upstream's NSMenu has no dedicated
    title row; we keep one slim toolbar pinned to the top so the popover
    exposes the same controls without dominating the layout. */
+
+/* Top action row inside MenuSurface: Refresh All at top-left, auxiliary window actions at top-right */
+.menu-surface__top-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 24px;
+}
+
+.menu-surface__refresh-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.12));
+  border-radius: 4px;
+  background: var(--surface-elevated, rgba(255, 255, 255, 0.06));
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+
+.menu-surface__refresh-btn:hover:not(:disabled) {
+  background: var(--surface-active, rgba(255, 255, 255, 0.1));
+  border-color: var(--border-medium, rgba(255, 255, 255, 0.2));
+}
+
+.menu-surface__refresh-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.menu-surface__refresh-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.menu-surface__refresh-icon {
+  font-size: 13px;
+  display: inline-block;
+  line-height: 1;
+}
+
+.menu-surface__section-title {
+  margin: 2px 0 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  letter-spacing: 0.01em;
+}
+
 .menu-surface__header {
   display: flex;
   align-items: center;
