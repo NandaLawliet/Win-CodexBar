@@ -84,6 +84,7 @@ function renderCard(
     showAsUsed?: boolean;
     showResetWhenExhausted?: boolean;
     showPace?: boolean;
+    compactMetrics?: boolean;
     onLayoutChange?: () => void;
   } = {},
 ) {
@@ -97,6 +98,7 @@ function renderCard(
           showAsUsed: opts.showAsUsed,
           showResetWhenExhausted: opts.showResetWhenExhausted,
           showPace: opts.showPace,
+          compactMetrics: opts.compactMetrics,
         }}
         onLayoutChange={opts.onLayoutChange}
       />
@@ -618,5 +620,159 @@ describe("MenuCard", () => {
     renderCard(snapshot);
 
     expect(await screen.findByText("3分前")).toBeInTheDocument();
+  });
+
+  describe("Antigravity 4-lane presentation", () => {
+    function antigravitySnapshot(opts?: {
+      gemini5hUsed?: number;
+      geminiWeeklyUsed?: number;
+      claudeGpt5hUsed?: number;
+      claudeGptWeeklyUsed?: number;
+      omitExtra?: boolean;
+      onlyGeminiWeekly?: boolean;
+    }): ProviderUsageSnapshot {
+      const g5 = opts?.gemini5hUsed ?? 11;
+      const gw = opts?.geminiWeeklyUsed ?? 22;
+      const cg5 = opts?.claudeGpt5hUsed ?? 33;
+      const cgw = opts?.claudeGptWeeklyUsed ?? 44;
+
+      const extras = opts?.omitExtra
+        ? []
+        : opts?.onlyGeminiWeekly
+          ? [
+              {
+                id: "gemini_weekly",
+                title: "Gemini (weekly)",
+                window: rateWindow(gw, {
+                  windowMinutes: 10080,
+                  resetDescription: "resets in 6d",
+                }),
+              },
+            ]
+          : [
+              {
+                id: "gemini_weekly",
+                title: "Gemini (weekly)",
+                window: rateWindow(gw, {
+                  windowMinutes: 10080,
+                  resetDescription: "resets in 6d",
+                }),
+              },
+              {
+                id: "claude_gpt_5h",
+                title: "Claude/GPT (5h)",
+                window: rateWindow(cg5, {
+                  windowMinutes: 300,
+                  resetDescription: "resets in 3h 15m",
+                }),
+              },
+              {
+                id: "claude_gpt_weekly",
+                title: "Claude/GPT (weekly)",
+                window: rateWindow(cgw, {
+                  windowMinutes: 10080,
+                  resetDescription: "resets in 5d 12h",
+                }),
+              },
+            ];
+
+      return {
+        providerId: "antigravity",
+        displayName: "Antigravity",
+        primary: rateWindow(g5, {
+          windowMinutes: 300,
+          resetDescription: "resets in 4h 20m",
+        }),
+        selectedMetric: rateWindow(g5, { windowMinutes: 300 }),
+        primaryLabel: "Gemini (5h)",
+        secondary: null,
+        modelSpecific: null,
+        tertiary: null,
+        extraRateWindows: extras,
+        cost: null,
+        planName: null,
+        accountEmail: null,
+        sourceLabel: "cli",
+        updatedAt: "2026-05-24T00:00:00Z",
+        error: null,
+        pace: null,
+        accountOrganization: null,
+        trayStatusLabel: null,
+        fetchDurationMs: 42,
+      };
+    }
+
+    it("renders four live named lanes with distinct percentages and reset descriptions in compact mode", async () => {
+      const snapshot = antigravitySnapshot({
+        gemini5hUsed: 11,
+        geminiWeeklyUsed: 22,
+        claudeGpt5hUsed: 33,
+        claudeGptWeeklyUsed: 44,
+      });
+
+      renderCard(snapshot, { showAsUsed: true, compactMetrics: true });
+
+      expect(await screen.findByText("Gemini 5h")).toBeInTheDocument();
+      expect(screen.getByText("Gemini Weekly")).toBeInTheDocument();
+      expect(screen.getByText("Claude/GPT 5h")).toBeInTheDocument();
+      expect(screen.getByText("Claude/GPT Weekly")).toBeInTheDocument();
+
+      expect(screen.getByText("11% used")).toBeInTheDocument();
+      expect(screen.getByText("22% used")).toBeInTheDocument();
+      expect(screen.getByText("33% used")).toBeInTheDocument();
+      expect(screen.getByText("44% used")).toBeInTheDocument();
+
+      expect(screen.getByText("resets in 4h 20m")).toBeInTheDocument();
+      expect(screen.getByText("resets in 6d")).toBeInTheDocument();
+      expect(screen.getByText("resets in 3h 15m")).toBeInTheDocument();
+      expect(screen.getByText("resets in 5d 12h")).toBeInTheDocument();
+    });
+
+    it("does not render legacy labels Claude or Gemini Pro", async () => {
+      const snapshot = antigravitySnapshot();
+      renderCard(snapshot);
+
+      expect(await screen.findByText("Gemini 5h")).toBeInTheDocument();
+      expect(screen.queryByText("Gemini Pro")).not.toBeInTheDocument();
+      expect(screen.queryByText("Claude")).not.toBeInTheDocument();
+    });
+
+    it("renders partial or missing lane input honestly without fabricating missing lanes", async () => {
+      const snapshot = antigravitySnapshot({ onlyGeminiWeekly: true });
+      renderCard(snapshot, { showAsUsed: true });
+
+      expect(await screen.findByText("Gemini 5h")).toBeInTheDocument();
+      expect(screen.getByText("Gemini Weekly")).toBeInTheDocument();
+      expect(screen.queryByText("Claude/GPT 5h")).not.toBeInTheDocument();
+      expect(screen.queryByText("Claude/GPT Weekly")).not.toBeInTheDocument();
+    });
+
+    it("preserves standard 2-metric compact layout for non-antigravity providers", async () => {
+      const codexSnapshot = provider(null, 15);
+      codexSnapshot.providerId = "codex";
+      codexSnapshot.displayName = "Codex";
+      codexSnapshot.primaryLabel = "5h limit";
+      codexSnapshot.secondaryLabel = "Weekly limit";
+      codexSnapshot.secondary = rateWindow(45);
+      codexSnapshot.extraRateWindows = [
+        {
+          id: "codex_extra_1",
+          title: "Extra 1",
+          window: rateWindow(60),
+        },
+        {
+          id: "codex_extra_2",
+          title: "Extra 2",
+          window: rateWindow(80),
+        },
+      ];
+
+      renderCard(codexSnapshot, { showAsUsed: true, compactMetrics: true });
+
+      expect(await screen.findByText("5h limit")).toBeInTheDocument();
+      expect(screen.getByText("Weekly limit")).toBeInTheDocument();
+      expect(screen.queryByText("Extra 1")).not.toBeInTheDocument();
+      expect(screen.queryByText("Extra 2")).not.toBeInTheDocument();
+    });
   });
 });

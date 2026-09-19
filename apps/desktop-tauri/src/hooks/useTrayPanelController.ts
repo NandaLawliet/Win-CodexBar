@@ -293,7 +293,6 @@ export function useTrayPanelController(state: BootstrapState) {
     { id: "settings", icon: "⚙", label: t("MenuSettings"), shortcut: "Ctrl+,", onClick: openSettings },
     { id: "about", icon: "ⓘ", label: t("MenuAbout"), onClick: openAbout },
     { id: "quit", icon: "⌧", label: t("MenuQuit"), shortcut: "Ctrl+Q", onClick: quitApp },
-    { id: "refresh", icon: "↻", label: t("ActionRefresh"), shortcut: "Ctrl+R", onClick: refresh },
   ];
 
   // Keyboard shortcuts
