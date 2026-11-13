@@ -8,6 +8,7 @@ use crate::surface_target::SurfaceTarget;
 
 pub(crate) mod dwm;
 pub mod flyout_window;
+pub mod quick_peek_window;
 mod geometry;
 mod position;
 pub mod settings_window;
