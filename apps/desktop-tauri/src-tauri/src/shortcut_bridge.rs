@@ -1,4 +1,4 @@
-//! Global keyboard shortcut registration for toggling the tray flyout.
+//! Global keyboard shortcut registration for toggling cursor Quick Peek.
 //!
 //! Reads the persisted `global_shortcut` setting (e.g. `"Ctrl+Shift+U"`)
 //! and registers it through the Tauri global-shortcut plugin. The shortcut
@@ -104,12 +104,12 @@ fn parse_key(token: &str) -> Option<Code> {
         .find_map(|(alias, code)| (*alias == normalized).then_some(*code))
 }
 
-/// Build the Tauri global-shortcut plugin with the tray-flyout handler.
+/// Build the Tauri global-shortcut plugin with the Quick Peek handler.
 pub fn plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
     tauri_plugin_global_shortcut::Builder::new()
         .with_handler(|app, _shortcut, event| {
             if event.state == ShortcutState::Pressed {
-                shell::flyout_window::toggle_with_blur_consume(app, None);
+                shell::quick_peek_window::toggle(app);
             }
         })
         .build()
