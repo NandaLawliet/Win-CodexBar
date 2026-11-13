@@ -12,6 +12,7 @@ import { useSurfaceSnapshot } from "./hooks/useSurfaceSnapshot";
 import { useTheme } from "./hooks/useTheme";
 import { useLocale } from "./hooks/useLocale";
 import TrayPanel from "./surfaces/TrayPanel";
+import QuickPeek from "./surfaces/QuickPeek";
 import { FLOATBAR_WINDOW_LABEL } from "./floatbar/api";
 import { LocaleProvider } from "./i18n/LocaleProvider";
 import type { BootstrapState, ThemePreference } from "./types/bridge";
@@ -48,9 +49,11 @@ function initialSettingsTab(): string {
 }
 
 export default function App() {
+  // Lightweight detached tooltip: skip the dashboard bootstrap/update work.
+  const isQuickPeek = getCurrentWebviewWindow().label === "quick-peek";
   return (
     <LocaleProvider>
-      <AppInner />
+      {isQuickPeek ? <QuickPeek /> : <AppInner />}
     </LocaleProvider>
   );
 }
