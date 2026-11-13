@@ -50,7 +50,7 @@ function initialSettingsTab(): string {
 
 export default function App() {
   // Lightweight detached tooltip: skip the dashboard bootstrap/update work.
-  const isQuickPeek = getCurrentWebviewWindow().label === "quick-peek";
+  const isQuickPeek = new URLSearchParams(window.location.search).get("window") === "quick-peek";
   return (
     <LocaleProvider>
       {isQuickPeek ? <QuickPeek /> : <AppInner />}
