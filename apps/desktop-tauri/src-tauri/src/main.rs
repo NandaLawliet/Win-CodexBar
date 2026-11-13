@@ -229,6 +229,8 @@ fn main() {
             commands::play_notification_sound,
             commands::open_external_url,
             commands::reanchor_tray_panel,
+            shell::quick_peek_window::reveal_quick_peek_window,
+            shell::quick_peek_window::dismiss_quick_peek_window,
             commands::quit_app,
             commands::open_provider_dashboard,
             commands::open_provider_status_page,
@@ -290,6 +292,9 @@ fn main() {
                 return;
             }
             if shell::flyout_window::handle_window_event(window, event) {
+                return;
+            }
+            if shell::quick_peek_window::handle_window_event(window, event) {
                 return;
             }
             // Only the main window participates in blur-dismiss and close-to-hide.
