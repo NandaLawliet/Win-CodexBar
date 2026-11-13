@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager, PhysicalPosition, WebviewUrl};
 
 pub const LABEL: &str = "quick-peek";
-const WIDTH: f64 = 140.0;
-const HEIGHT: f64 = 134.0;
+const WIDTH: f64 = 128.0;
+const HEIGHT: f64 = 126.0;
 const CURSOR_GAP: i32 = 12;
 const BLUR_GRACE: Duration = Duration::from_millis(250);
 
